@@ -65,7 +65,7 @@
             android:id="@+id/speedSeek"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:max="60"
+            android:max="1000"
             android:progress="5" />
 
         <Switch
@@ -92,7 +92,8 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Vaga area" />
+                android:text="Avvia (vaga)"
+                android:backgroundTint="#1B5E20" />
 
             <Button
                 android:id="@+id/stopButton"

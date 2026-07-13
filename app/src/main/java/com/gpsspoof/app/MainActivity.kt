@@ -2,8 +2,10 @@ package com.gpsspoof.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -26,6 +28,7 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.TilesOverlay
 import java.net.HttpURLConnection
 import java.net.URL
@@ -44,6 +47,29 @@ class MainActivity : Activity() {
 
     private var centerMarker: Marker? = null
     private var shapePolygon: Polygon? = null
+
+    private var posMarker: Marker? = null
+    private var pathLine: Polyline? = null
+    private val pathPoints = ArrayList<GeoPoint>()
+
+    private var receiverRegistered = false
+    private val updateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            i ?: return
+            val lat = i.getDoubleExtra(MockLocationService.EXTRA_LAT, Double.NaN)
+            val lng = i.getDoubleExtra(MockLocationService.EXTRA_LNG, Double.NaN)
+            val cov = i.getIntExtra(MockLocationService.EXTRA_COV, -1)
+            if (lat.isNaN() || lng.isNaN()) return
+            val gp = GeoPoint(lat, lng)
+            ensureLiveOverlays()
+            pathPoints.add(gp)
+            if (pathPoints.size > 6000) pathPoints.removeAt(0)
+            pathLine?.setPoints(pathPoints)
+            posMarker?.position = gp
+            map.invalidate()
+            if (cov >= 0) setStatus("Vaga area — copertura $cov%")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -103,6 +129,7 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.roamButton).setOnClickListener { startRoam() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             stopService(Intent(this, MockLocationService::class.java))
+            clearLiveOverlays()
             setStatus("Fermo")
         }
     }
@@ -123,7 +150,6 @@ class MainActivity : Activity() {
         map.setTileSource(sat)
         map.setMultiTouchControls(true)
 
-        // Overlay etichette (nomi vie/citta) -> ibrida
         val labelSource = object : OnlineTileSourceBase(
             "EsriLabels", 0, 19, 256, "",
             arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/")
@@ -139,7 +165,6 @@ class MainActivity : Activity() {
         labelsOverlay.loadingLineColor = Color.TRANSPARENT
         map.overlays.add(labelsOverlay)
 
-        // Tocco = imposta punto
         val receiver = object : MapEventsReceiver {
             override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
                 setCenter(p, false)
@@ -199,6 +224,34 @@ class MainActivity : Activity() {
         )
     }
 
+    // ---------------- live overlays (puntino + scia) ----------------
+
+    private fun ensureLiveOverlays() {
+        if (pathLine == null) {
+            val pl = Polyline(map)
+            pl.outlinePaint.color = Color.RED
+            pl.outlinePaint.strokeWidth = 6f
+            pathLine = pl
+            map.overlays.add(pl)
+        }
+        if (posMarker == null) {
+            val pm = Marker(map)
+            pm.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            pm.title = "Posizione finta"
+            posMarker = pm
+            map.overlays.add(pm)
+        }
+    }
+
+    private fun clearLiveOverlays() {
+        pathLine?.let { map.overlays.remove(it) }
+        posMarker?.let { map.overlays.remove(it) }
+        pathLine = null
+        posMarker = null
+        pathPoints.clear()
+        map.invalidate()
+    }
+
     // ---------------- search ----------------
 
     private fun search(query: String) {
@@ -239,6 +292,7 @@ class MainActivity : Activity() {
     private fun startFixed() {
         val cp = centerPoint ?: return
         if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+        clearLiveOverlays()
         val i = Intent(this, MockLocationService::class.java).apply {
             putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_FIXED)
             putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
@@ -251,6 +305,7 @@ class MainActivity : Activity() {
     private fun startRoam() {
         val cp = centerPoint ?: return
         if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+        clearLiveOverlays()
         val i = Intent(this, MockLocationService::class.java).apply {
             putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_ROAM)
             putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
@@ -260,7 +315,7 @@ class MainActivity : Activity() {
             putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
         }
         startForegroundService(i)
-        setStatus("Vaga area attivo ($speedKmh km/h, $radiusMeters m)")
+        setStatus("Vaga area avviato ($speedKmh km/h, $radiusMeters m)")
     }
 
     // ---------------- misc ----------------
@@ -287,10 +342,27 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         map.onResume()
+        if (!receiverRegistered) {
+            val f = IntentFilter(MockLocationService.ACTION_UPDATE)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(updateReceiver, f, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(updateReceiver, f)
+            }
+            receiverRegistered = true
+        }
     }
 
     override fun onPause() {
         super.onPause()
         map.onPause()
+        if (receiverRegistered) {
+            try {
+                unregisterReceiver(updateReceiver)
+            } catch (e: Exception) {
+            }
+            receiverRegistered = false
+        }
     }
 }
