@@ -21,6 +21,7 @@ import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 class MockLocationService : Service() {
 
@@ -31,6 +32,7 @@ class MockLocationService : Service() {
         const val EXTRA_RADIUS = "radius"
         const val EXTRA_SQUARE = "square"
         const val EXTRA_SPEED_KMH = "speed_kmh"
+        const val EXTRA_SERPENTINE = "serpentine"
         const val EXTRA_COV = "coverage"
         const val MODE_FIXED = "fixed"
         const val MODE_ROAM = "roam"
@@ -41,6 +43,7 @@ class MockLocationService : Service() {
         private const val UPDATE_MS = 1000L
         private const val METERS_PER_DEG = 111320.0
         private const val GRID_N = 40
+        private const val LANES = 25
     }
 
     private lateinit var lm: LocationManager
@@ -98,14 +101,16 @@ class MockLocationService : Service() {
                 val radius = intent.getIntExtra(EXTRA_RADIUS, 500)
                 val square = intent.getBooleanExtra(EXTRA_SQUARE, false)
                 val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 5.0)
-                startRoam(lat, lng, radius, square, speedKmh)
+                val serpentine = intent.getBooleanExtra(EXTRA_SERPENTINE, true)
+                if (serpentine) startSweep(lat, lng, radius, square, speedKmh)
+                else startRandom(lat, lng, radius, square, speedKmh)
             }
             else -> stopSelf()
         }
         return START_NOT_STICKY
     }
 
-    // ---------------- modes ----------------
+    // ---------------- fisso ----------------
 
     private fun startFixed(lat: Double, lng: Double) {
         running = true
@@ -118,16 +123,103 @@ class MockLocationService : Service() {
         updateNotification("Posizione fissa: $lat, $lng")
     }
 
-    private fun startRoam(cLat: Double, cLng: Double, radius: Int, square: Boolean, speedKmh: Double) {
+    // ---------------- serpentina (su/giu) ----------------
+
+    private fun startSweep(cLat: Double, cLng: Double, radius: Int, square: Boolean, speedKmh: Double) {
         val speedMs = (speedKmh / 3.6).coerceAtLeast(0.3)
-        val intervalSec = UPDATE_MS / 1000.0
-        val stepM = speedMs * intervalSec
-        val latRad = Math.toRadians(cLat)
-        val cosLat = cos(latRad)
+        val stepM = speedMs * (UPDATE_MS / 1000.0)
+        val cosLat = cos(Math.toRadians(cLat))
         val dLatMax = radius / METERS_PER_DEG
         val dLngMax = radius / (METERS_PER_DEG * cosLat)
 
-        // griglia copertura
+        // costruisci i vertici della serpentina (corsie verticali nord-sud, da ovest a est)
+        val verts = ArrayList<DoubleArray>()
+        for (li in 0..LANES) {
+            val rLng = -dLngMax + (2 * dLngMax) * li / LANES
+            val half: Double = if (square) {
+                dLatMax
+            } else {
+                val t = rLng / dLngMax
+                if (Math.abs(t) >= 0.999) continue
+                dLatMax * sqrt(1 - t * t)
+            }
+            if (half <= 0) continue
+            val bottom = doubleArrayOf(cLat - half, cLng + rLng)
+            val top = doubleArrayOf(cLat + half, cLng + rLng)
+            if (li % 2 == 0) {
+                verts.add(bottom); verts.add(top)   // su
+            } else {
+                verts.add(top); verts.add(bottom)   // giu
+            }
+        }
+
+        if (verts.size < 2) {
+            startRandom(cLat, cLng, radius, square, speedKmh)
+            return
+        }
+
+        // lunghezza totale del percorso
+        var totalLen = 0.0
+        for (i in 0 until verts.size - 1) totalLen += distM(verts[i], verts[i + 1], cosLat)
+        if (totalLen <= 0) totalLen = 1.0
+
+        running = true
+        worker = Thread {
+            var seg = 0
+            var cur = doubleArrayOf(verts[0][0], verts[0][1])
+            var traveled = 0.0
+            var lastBearing = 0f
+
+            while (running) {
+                var stepRemaining = stepM
+                var guard = 0
+                while (stepRemaining > 0 && running && guard < verts.size + 2) {
+                    val tgt = verts[seg + 1]
+                    val segLen = distM(cur, tgt, cosLat)
+                    lastBearing = bearingOf(cur, tgt, cosLat)
+                    if (segLen <= stepRemaining) {
+                        cur = doubleArrayOf(tgt[0], tgt[1])
+                        stepRemaining -= segLen
+                        traveled += segLen
+                        seg++
+                        if (seg >= verts.size - 1) {
+                            // percorso completato: ricomincia
+                            seg = 0
+                            cur = doubleArrayOf(verts[0][0], verts[0][1])
+                            traveled = 0.0
+                            guard++
+                        }
+                    } else {
+                        val f = stepRemaining / segLen
+                        cur = doubleArrayOf(
+                            cur[0] + (tgt[0] - cur[0]) * f,
+                            cur[1] + (tgt[1] - cur[1]) * f
+                        )
+                        traveled += stepRemaining
+                        stepRemaining = 0.0
+                    }
+                }
+
+                val cov = (traveled * 100 / totalLen).toInt().coerceIn(0, 100)
+                push(cur[0], cur[1], speedMs.toFloat(), lastBearing)
+                broadcast(cur[0], cur[1], cov)
+                if (traveled < stepM) updateNotification("Serpentina: nuovo giro")
+                else updateNotification("Serpentina: completato $cov%")
+                sleep(UPDATE_MS)
+            }
+        }.also { it.start() }
+        updateNotification("Serpentina avviata (r=${radius}m, ${speedKmh} km/h)")
+    }
+
+    // ---------------- a caso ----------------
+
+    private fun startRandom(cLat: Double, cLng: Double, radius: Int, square: Boolean, speedKmh: Double) {
+        val speedMs = (speedKmh / 3.6).coerceAtLeast(0.3)
+        val stepM = speedMs * (UPDATE_MS / 1000.0)
+        val cosLat = cos(Math.toRadians(cLat))
+        val dLatMax = radius / METERS_PER_DEG
+        val dLngMax = radius / (METERS_PER_DEG * cosLat)
+
         val minLat = cLat - dLatMax
         val minLng = cLng - dLngMax
         val cellLat = (2 * dLatMax) / GRID_N
@@ -137,60 +229,37 @@ class MockLocationService : Service() {
         var totalInside = 0
         for (iy in 0 until GRID_N) {
             for (ix in 0 until GRID_N) {
-                val ccLat = minLat + (iy + 0.5) * cellLat
-                val ccLng = minLng + (ix + 0.5) * cellLng
-                val rLat = ccLat - cLat
-                val rLng = ccLng - cLng
-                val isin = if (square) {
-                    Math.abs(rLat) <= dLatMax && Math.abs(rLng) <= dLngMax
-                } else {
-                    hypot(rLat / dLatMax, rLng / dLngMax) <= 1.0
-                }
-                if (isin) {
-                    inside[iy * GRID_N + ix] = true
-                    totalInside++
-                }
+                val rLat = (minLat + (iy + 0.5) * cellLat) - cLat
+                val rLng = (minLng + (ix + 0.5) * cellLng) - cLng
+                val isin = if (square) Math.abs(rLat) <= dLatMax && Math.abs(rLng) <= dLngMax
+                else hypot(rLat / dLatMax, rLng / dLngMax) <= 1.0
+                if (isin) { inside[iy * GRID_N + ix] = true; totalInside++ }
             }
         }
         if (totalInside == 0) totalInside = 1
         var visitedCount = 0
 
-        fun cellIdx(lat: Double, lng: Double): Int {
+        fun markVisited(lat: Double, lng: Double) {
             val ix = ((lng - minLng) / cellLng).toInt().coerceIn(0, GRID_N - 1)
             val iy = ((lat - minLat) / cellLat).toInt().coerceIn(0, GRID_N - 1)
-            return iy * GRID_N + ix
-        }
-
-        fun markVisited(lat: Double, lng: Double) {
-            val idx = cellIdx(lat, lng)
-            if (inside[idx] && !visited[idx]) {
-                visited[idx] = true
-                visitedCount++
-            }
+            val idx = iy * GRID_N + ix
+            if (inside[idx] && !visited[idx]) { visited[idx] = true; visitedCount++ }
         }
 
         fun pickTarget(): DoubleArray {
-            // cerca una cella non ancora visitata (copre tutta l'area)
             repeat(300) {
                 val ix = (Math.random() * GRID_N).toInt().coerceIn(0, GRID_N - 1)
                 val iy = (Math.random() * GRID_N).toInt().coerceIn(0, GRID_N - 1)
                 val idx = iy * GRID_N + ix
-                if (inside[idx] && !visited[idx]) {
-                    val tLat = minLat + (iy + Math.random()) * cellLat
-                    val tLng = minLng + (ix + Math.random()) * cellLng
-                    return doubleArrayOf(tLat, tLng)
-                }
+                if (inside[idx] && !visited[idx])
+                    return doubleArrayOf(minLat + (iy + Math.random()) * cellLat, minLng + (ix + Math.random()) * cellLng)
             }
-            // tutto visitato: punto a caso dentro
             repeat(300) {
                 val ix = (Math.random() * GRID_N).toInt().coerceIn(0, GRID_N - 1)
                 val iy = (Math.random() * GRID_N).toInt().coerceIn(0, GRID_N - 1)
                 val idx = iy * GRID_N + ix
-                if (inside[idx]) {
-                    val tLat = minLat + (iy + Math.random()) * cellLat
-                    val tLng = minLng + (ix + Math.random()) * cellLng
-                    return doubleArrayOf(tLat, tLng)
-                }
+                if (inside[idx])
+                    return doubleArrayOf(minLat + (iy + Math.random()) * cellLat, minLng + (ix + Math.random()) * cellLng)
             }
             return doubleArrayOf(cLat, cLng)
         }
@@ -203,62 +272,54 @@ class MockLocationService : Service() {
             var target = pickTarget()
             var tick = 0
             markVisited(lat, lng)
-
             while (running) {
-                val dxm = (target[1] - lng) * METERS_PER_DEG * cosLat // est
-                val dym = (target[0] - lat) * METERS_PER_DEG          // nord
+                val dxm = (target[1] - lng) * METERS_PER_DEG * cosLat
+                val dym = (target[0] - lat) * METERS_PER_DEG
                 val dist = hypot(dxm, dym)
-                val angleTo = atan2(dxm, dym) // 0 = nord, senso orario
+                val angleTo = atan2(dxm, dym)
+                heading += norm(angleTo - heading).coerceIn(-0.25, 0.25) + (Math.random() - 0.5) * 0.15
 
-                // gira verso il target con velocita limitata (linee dritte + curve)
-                val diff = norm(angleTo - heading)
-                heading += diff.coerceIn(-0.25, 0.25) + (Math.random() - 0.5) * 0.15
-
-                val stepLat = (stepM * cos(heading)) / METERS_PER_DEG
-                val stepLng = (stepM * sin(heading)) / (METERS_PER_DEG * cosLat)
-                var nLat = lat + stepLat
-                var nLng = lng + stepLng
-
-                // resta dentro la forma
+                var nLat = lat + (stepM * cos(heading)) / METERS_PER_DEG
+                var nLng = lng + (stepM * sin(heading)) / (METERS_PER_DEG * cosLat)
                 var rLat = nLat - cLat
                 var rLng = nLng - cLng
-                val outside = if (square) {
-                    Math.abs(rLat) > dLatMax || Math.abs(rLng) > dLngMax
-                } else {
-                    hypot(rLat / dLatMax, rLng / dLngMax) > 1.0
-                }
+                val outside = if (square) Math.abs(rLat) > dLatMax || Math.abs(rLng) > dLngMax
+                else hypot(rLat / dLatMax, rLng / dLngMax) > 1.0
                 if (outside) {
-                    if (square) {
-                        rLat = rLat.coerceIn(-dLatMax, dLatMax)
-                        rLng = rLng.coerceIn(-dLngMax, dLngMax)
-                    } else {
-                        val k = hypot(rLat / dLatMax, rLng / dLngMax)
-                        rLat /= k
-                        rLng /= k
-                    }
-                    nLat = cLat + rLat
-                    nLng = cLng + rLng
-                    target = pickTarget() // nuovo obiettivo, evita di incastrarsi sul bordo
-                }
-
-                lat = nLat
-                lng = nLng
-                markVisited(lat, lng)
-
-                tick++
-                // nuovo obiettivo se arrivato o ogni ~5s (movimento a casaccio)
-                if (dist < stepM * 1.5 || tick % 5 == 0) {
+                    if (square) { rLat = rLat.coerceIn(-dLatMax, dLatMax); rLng = rLng.coerceIn(-dLngMax, dLngMax) }
+                    else { val k = hypot(rLat / dLatMax, rLng / dLngMax); rLat /= k; rLng /= k }
+                    nLat = cLat + rLat; nLng = cLng + rLng
                     target = pickTarget()
                 }
+                lat = nLat; lng = nLng
+                markVisited(lat, lng)
+                tick++
+                if (dist < stepM * 1.5 || tick % 5 == 0) target = pickTarget()
 
                 val cov = (visitedCount * 100 / totalInside).coerceIn(0, 100)
                 push(lat, lng, speedMs.toFloat(), Math.toDegrees(heading).toFloat())
                 broadcast(lat, lng, cov)
-                if (tick % 3 == 0) updateNotification("Vaga area: copertura $cov% (r=${radius}m)")
+                if (tick % 3 == 0) updateNotification("A caso: copertura $cov%")
                 sleep(UPDATE_MS)
             }
         }.also { it.start() }
-        updateNotification("Vaga area: r=${radius}m, ${speedKmh} km/h")
+        updateNotification("A caso avviato (r=${radius}m, ${speedKmh} km/h)")
+    }
+
+    // ---------------- geo helpers ----------------
+
+    private fun distM(a: DoubleArray, b: DoubleArray, cosLat: Double): Double {
+        val dxm = (b[1] - a[1]) * METERS_PER_DEG * cosLat
+        val dym = (b[0] - a[0]) * METERS_PER_DEG
+        return hypot(dxm, dym)
+    }
+
+    private fun bearingOf(a: DoubleArray, b: DoubleArray, cosLat: Double): Float {
+        val dxm = (b[1] - a[1]) * METERS_PER_DEG * cosLat
+        val dym = (b[0] - a[0]) * METERS_PER_DEG
+        var deg = Math.toDegrees(atan2(dxm, dym)).toFloat()
+        if (deg < 0) deg += 360f
+        return deg
     }
 
     private fun norm(a: Double): Double {
@@ -297,7 +358,6 @@ class MockLocationService : Service() {
             } catch (e: SecurityException) {
                 return false
             } catch (e: Exception) {
-                // provider non disponibile su questo device, ignora
             }
         }
         try {

@@ -313,6 +313,7 @@ class MainActivity : Activity() {
             putExtra(MockLocationService.EXTRA_RADIUS, radiusMeters)
             putExtra(MockLocationService.EXTRA_SQUARE, isSquare)
             putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
+            putExtra(MockLocationService.EXTRA_SERPENTINE, findViewById<Switch>(R.id.sweepSwitch).isChecked)
         }
         startForegroundService(i)
         setStatus("Vaga area avviato ($speedKmh km/h, $radiusMeters m)")

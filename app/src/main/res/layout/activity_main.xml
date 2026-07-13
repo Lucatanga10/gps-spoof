@@ -74,6 +74,13 @@
             android:layout_height="wrap_content"
             android:text="Forma quadrato (spento = cerchio)" />
 
+        <Switch
+            android:id="@+id/sweepSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="Serpentina su/giu (spento = a caso)" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
