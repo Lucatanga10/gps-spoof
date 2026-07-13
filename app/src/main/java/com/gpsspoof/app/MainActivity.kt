@@ -34,6 +34,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import kotlin.math.cos
+import kotlin.math.sqrt
 
 class MainActivity : Activity() {
 
@@ -49,8 +50,7 @@ class MainActivity : Activity() {
     private var shapePolygon: Polygon? = null
 
     private var posMarker: Marker? = null
-    private var pathLine: Polyline? = null
-    private val pathPoints = ArrayList<GeoPoint>()
+    private var plannedLine: Polyline? = null
 
     private var receiverRegistered = false
     private val updateReceiver = object : BroadcastReceiver() {
@@ -60,14 +60,10 @@ class MainActivity : Activity() {
             val lng = i.getDoubleExtra(MockLocationService.EXTRA_LNG, Double.NaN)
             val cov = i.getIntExtra(MockLocationService.EXTRA_COV, -1)
             if (lat.isNaN() || lng.isNaN()) return
-            val gp = GeoPoint(lat, lng)
-            ensureLiveOverlays()
-            pathPoints.add(gp)
-            if (pathPoints.size > 6000) pathPoints.removeAt(0)
-            pathLine?.setPoints(pathPoints)
-            posMarker?.position = gp
+            ensurePosMarker()
+            posMarker?.position = GeoPoint(lat, lng)
             map.invalidate()
-            if (cov >= 0) setStatus("Vaga area — copertura $cov%")
+            if (cov >= 0) setStatus("In movimento — completato $cov%")
         }
     }
 
@@ -194,7 +190,7 @@ class MainActivity : Activity() {
         val poly = Polygon(map)
         poly.outlinePaint.color = Color.YELLOW
         poly.outlinePaint.strokeWidth = 5f
-        poly.fillPaint.color = Color.argb(60, 0, 150, 255)
+        poly.fillPaint.color = Color.argb(50, 0, 150, 255)
         poly.points = if (isSquare) squarePoints(cp, radiusMeters) else Polygon.pointsAsCircle(cp, radiusMeters.toDouble())
         shapePolygon = poly
         map.overlays.add(poly)
@@ -224,16 +220,34 @@ class MainActivity : Activity() {
         )
     }
 
-    // ---------------- live overlays (puntino + scia) ----------------
-
-    private fun ensureLiveOverlays() {
-        if (pathLine == null) {
-            val pl = Polyline(map)
-            pl.outlinePaint.color = Color.RED
-            pl.outlinePaint.strokeWidth = 6f
-            pathLine = pl
-            map.overlays.add(pl)
+    // stessa serpentina del service: disegna tutte le corsie rosse = area piena
+    private fun buildSerpentine(c: GeoPoint, r: Int, square: Boolean): List<GeoPoint> {
+        val cosLat = cos(Math.toRadians(c.latitude))
+        val dLatMax = r / 111320.0
+        val dLngMax = r / (111320.0 * cosLat)
+        val laneSpacing = Math.max(3.0, r / 60.0)
+        val lanes = Math.max(2, Math.ceil((2.0 * r) / laneSpacing).toInt())
+        val out = ArrayList<GeoPoint>()
+        for (li in 0..lanes) {
+            val rLng = -dLngMax + (2 * dLngMax) * li / lanes
+            val half: Double = if (square) {
+                dLatMax
+            } else {
+                val t = rLng / dLngMax
+                if (Math.abs(t) >= 0.999) continue
+                dLatMax * sqrt(1 - t * t)
+            }
+            if (half <= 0) continue
+            val bottom = GeoPoint(c.latitude - half, c.longitude + rLng)
+            val top = GeoPoint(c.latitude + half, c.longitude + rLng)
+            if (li % 2 == 0) { out.add(top); out.add(bottom) } else { out.add(bottom); out.add(top) }
         }
+        return out
+    }
+
+    // ---------------- live overlays ----------------
+
+    private fun ensurePosMarker() {
         if (posMarker == null) {
             val pm = Marker(map)
             pm.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
@@ -243,12 +257,27 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun drawPlanned(serpentine: Boolean) {
+        plannedLine?.let { map.overlays.remove(it) }
+        plannedLine = null
+        val cp = centerPoint ?: return
+        if (!serpentine) return
+        val pts = buildSerpentine(cp, radiusMeters, isSquare)
+        if (pts.size < 2) return
+        val pl = Polyline(map)
+        pl.outlinePaint.color = Color.argb(200, 255, 0, 0)
+        pl.outlinePaint.strokeWidth = 16f
+        pl.setPoints(pts)
+        plannedLine = pl
+        map.overlays.add(pl)
+        map.invalidate()
+    }
+
     private fun clearLiveOverlays() {
-        pathLine?.let { map.overlays.remove(it) }
+        plannedLine?.let { map.overlays.remove(it) }
         posMarker?.let { map.overlays.remove(it) }
-        pathLine = null
+        plannedLine = null
         posMarker = null
-        pathPoints.clear()
         map.invalidate()
     }
 
@@ -305,7 +334,9 @@ class MainActivity : Activity() {
     private fun startRoam() {
         val cp = centerPoint ?: return
         if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+        val serpentine = findViewById<Switch>(R.id.sweepSwitch).isChecked
         clearLiveOverlays()
+        drawPlanned(serpentine)
         val i = Intent(this, MockLocationService::class.java).apply {
             putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_ROAM)
             putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
@@ -313,10 +344,10 @@ class MainActivity : Activity() {
             putExtra(MockLocationService.EXTRA_RADIUS, radiusMeters)
             putExtra(MockLocationService.EXTRA_SQUARE, isSquare)
             putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
-            putExtra(MockLocationService.EXTRA_SERPENTINE, findViewById<Switch>(R.id.sweepSwitch).isChecked)
+            putExtra(MockLocationService.EXTRA_SERPENTINE, serpentine)
         }
         startForegroundService(i)
-        setStatus("Vaga area avviato ($speedKmh km/h, $radiusMeters m)")
+        setStatus("Avviato ($speedKmh km/h, $radiusMeters m)")
     }
 
     // ---------------- misc ----------------
