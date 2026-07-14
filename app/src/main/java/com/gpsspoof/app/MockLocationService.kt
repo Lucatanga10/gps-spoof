@@ -43,6 +43,10 @@ class MockLocationService : Service() {
         private const val UPDATE_MS = 1000L
         private const val METERS_PER_DEG = 111320.0
         private const val GRID_N = 40
+
+        // corsie serpentina: devono combaciare con MainActivity (attaccate, con tetto)
+        private const val LANE_WIDTH_M = 8.0
+        private const val MAX_LANES = 4000
     }
 
     private lateinit var lm: LocationManager
@@ -132,7 +136,7 @@ class MockLocationService : Service() {
         val dLngMax = radius / (METERS_PER_DEG * cosLat)
 
         // corsie verticali fitte (nord-sud), da ovest a est, attaccate = area tutta piena
-        val laneSpacing = Math.max(3.0, radius / 60.0)
+        val laneSpacing = Math.max(LANE_WIDTH_M, (2.0 * radius) / MAX_LANES)
         val lanes = Math.max(2, Math.ceil((2.0 * radius) / laneSpacing).toInt())
         val verts = ArrayList<DoubleArray>()
         for (li in 0..lanes) {

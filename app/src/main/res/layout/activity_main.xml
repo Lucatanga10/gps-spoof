@@ -81,6 +81,14 @@
             android:checked="true"
             android:text="Serpentina su/giu (spento = a caso)" />
 
+        <TextView
+            android:id="@+id/etaLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Giro completo: ~?"
+            android:textStyle="bold"
+            android:paddingTop="4dp" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -51,6 +51,10 @@ class MainActivity : Activity() {
     private val maxRadius = 10_000_000.0
     private val radiusSteps = 1000
 
+    // corsie serpentina: fitte = attaccate (niente buchi), con tetto per non esplodere la memoria
+    private val laneWidthM = 8.0
+    private val maxLanes = 4000
+
     private var centerMarker: Marker? = null
     private var shapePolygon: Polygon? = null
 
@@ -99,6 +103,7 @@ class MainActivity : Activity() {
                 radiusMeters = progressToRadius(p)
                 radiusLabel.text = formatRadius(radiusMeters)
                 redraw(false)
+                updateEta()
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -108,6 +113,7 @@ class MainActivity : Activity() {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                 speedKmh = p.coerceAtLeast(1)
                 speedLabel.text = "Velocita: $speedKmh km/h"
+                updateEta()
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -116,7 +122,10 @@ class MainActivity : Activity() {
         shapeSwitch.setOnCheckedChangeListener { _, checked ->
             isSquare = checked
             redraw(false)
+            updateEta()
         }
+
+        updateEta()
 
         findViewById<Button>(R.id.searchButton).setOnClickListener {
             search(searchInput.text.toString().trim())
@@ -198,6 +207,56 @@ class MainActivity : Activity() {
         return if (m >= 1000) "Raggio: %.1f km".format(m / 1000.0) else "Raggio: $m m"
     }
 
+    // numero di corsie: spaziatura fitta (attaccate) ma con tetto maxLanes
+    private fun laneCountFor(r: Int): Int {
+        val spacing = Math.max(laneWidthM, (2.0 * r) / maxLanes)
+        return Math.max(2, Math.ceil((2.0 * r) / spacing).toInt())
+    }
+
+    // lunghezza totale del giro serpentina in metri (verticali + collegamenti orizzontali)
+    private fun estimatePathMeters(r: Int, square: Boolean): Double {
+        if (r <= 0) return 0.0
+        val lanes = laneCountFor(r)
+        var vertical = 0.0
+        for (li in 0..lanes) {
+            val t = -1.0 + 2.0 * li / lanes
+            val half = if (square) 1.0 else {
+                if (Math.abs(t) >= 0.999) continue
+                sqrt(1 - t * t)
+            }
+            vertical += 2.0 * half * r    // altezza corsia in metri
+        }
+        val horizontal = 2.0 * r          // collegamenti da un lato all'altro
+        return vertical + horizontal
+    }
+
+    private fun formatEta(r: Int, square: Boolean, kmh: Int): String {
+        val speedMs = Math.max(0.3, kmh / 3.6)
+        val meters = estimatePathMeters(r, square)
+        val secs = meters / speedMs
+        val forma = if (square) "quadrato" else "cerchio"
+        return "Giro $forma completo: ~${humanTime(secs)} (${"%.0f".format(meters / 1000.0)} km)"
+    }
+
+    private fun humanTime(totalSecs: Double): String {
+        if (totalSecs.isInfinite() || totalSecs.isNaN()) return "?"
+        var s = totalSecs.toLong()
+        val d = s / 86400; s %= 86400
+        val h = s / 3600; s %= 3600
+        val m = s / 60; s %= 60
+        return when {
+            d > 0 -> "${d}g ${h}h ${m}min"
+            h > 0 -> "${h}h ${m}min"
+            m > 0 -> "${m}min ${s}s"
+            else -> "${s}s"
+        }
+    }
+
+    private fun updateEta() {
+        val label = findViewById<TextView>(R.id.etaLabel) ?: return
+        label.text = formatEta(radiusMeters, isSquare, speedKmh)
+    }
+
     private fun shapePointsFor(cp: GeoPoint): List<GeoPoint> =
         if (isSquare) squarePoints(cp, radiusMeters) else Polygon.pointsAsCircle(cp, radiusMeters.toDouble())
 
@@ -263,8 +322,7 @@ class MainActivity : Activity() {
         val cosLat = cos(Math.toRadians(c.latitude))
         val dLatMax = r / 111320.0
         val dLngMax = r / (111320.0 * cosLat)
-        val laneSpacing = Math.max(3.0, r / 60.0)
-        val lanes = Math.max(2, Math.ceil((2.0 * r) / laneSpacing).toInt())
+        val lanes = laneCountFor(r)
         val out = ArrayList<GeoPoint>()
         for (li in 0..lanes) {
             val rLng = -dLngMax + (2 * dLngMax) * li / lanes
