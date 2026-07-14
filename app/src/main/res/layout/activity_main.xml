@@ -52,8 +52,8 @@
             android:id="@+id/radiusSeek"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:max="5000"
-            android:progress="500" />
+            android:max="1000"
+            android:progress="245" />
 
         <TextView
             android:id="@+id/speedLabel"

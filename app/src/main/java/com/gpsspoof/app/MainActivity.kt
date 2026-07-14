@@ -46,6 +46,11 @@ class MainActivity : Activity() {
     private var speedKmh: Int = 5
     private var isSquare: Boolean = false
 
+    // scala raggio logaritmica: barra 0..1000 -> 20 m .. 10.000.000 m
+    private val minRadius = 20.0
+    private val maxRadius = 10_000_000.0
+    private val radiusSteps = 1000
+
     private var centerMarker: Marker? = null
     private var shapePolygon: Polygon? = null
 
@@ -88,10 +93,11 @@ class MainActivity : Activity() {
         val shapeSwitch = findViewById<Switch>(R.id.shapeSwitch)
         val searchInput = findViewById<EditText>(R.id.searchInput)
 
+        radiusSeek.max = radiusSteps
         radiusSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                radiusMeters = p.coerceAtLeast(20)
-                radiusLabel.text = "Raggio: $radiusMeters m"
+                radiusMeters = progressToRadius(p)
+                radiusLabel.text = formatRadius(radiusMeters)
                 redraw(false)
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -182,6 +188,26 @@ class MainActivity : Activity() {
         setStatus("Punto: %.5f, %.5f".format(p.latitude, p.longitude))
     }
 
+    // barra -> metri, scala logaritmica (fine sui piccoli, enorme in cima)
+    private fun progressToRadius(p: Int): Int {
+        val frac = p.toDouble() / radiusSteps
+        return Math.round(minRadius * Math.pow(maxRadius / minRadius, frac)).toInt().coerceAtLeast(20)
+    }
+
+    private fun formatRadius(m: Int): String {
+        return if (m >= 1000) "Raggio: %.1f km".format(m / 1000.0) else "Raggio: $m m"
+    }
+
+    private fun shapePointsFor(cp: GeoPoint): List<GeoPoint> =
+        if (isSquare) squarePoints(cp, radiusMeters) else Polygon.pointsAsCircle(cp, radiusMeters.toDouble())
+
+    // aggiorna solo il cerchio/quadrato (usato mentre trascini il pin, tiene il pin sopra)
+    private fun updateShapePolygon() {
+        val cp = centerPoint ?: return
+        shapePolygon?.points = shapePointsFor(cp)
+        map.invalidate()
+    }
+
     private fun redraw(moveMap: Boolean) {
         val cp = centerPoint ?: return
         centerMarker?.let { map.overlays.remove(it) }
@@ -191,14 +217,26 @@ class MainActivity : Activity() {
         poly.outlinePaint.color = Color.YELLOW
         poly.outlinePaint.strokeWidth = 5f
         poly.fillPaint.color = Color.argb(50, 0, 150, 255)
-        poly.points = if (isSquare) squarePoints(cp, radiusMeters) else Polygon.pointsAsCircle(cp, radiusMeters.toDouble())
+        poly.points = shapePointsFor(cp)
         shapePolygon = poly
         map.overlays.add(poly)
 
         val m = Marker(map)
         m.position = cp
         m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-        m.title = "Centro"
+        m.title = "Trascina per spostare"
+        m.isDraggable = true
+        m.setOnMarkerDragListener(object : Marker.OnMarkerDragListener {
+            override fun onMarkerDragStart(marker: Marker) {}
+            override fun onMarkerDrag(marker: Marker) {
+                // il pin si muove col dito: il cerchio/quadrato lo segue
+                centerPoint = marker.position
+                updateShapePolygon()
+            }
+            override fun onMarkerDragEnd(marker: Marker) {
+                setCenter(marker.position, false)
+            }
+        })
         centerMarker = m
         map.overlays.add(m)
 
