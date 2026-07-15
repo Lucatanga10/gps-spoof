@@ -67,6 +67,11 @@ Senza questo passo NON funziona.
 basso compaiono i numeri tipo `44.6469, 10.9252`. Primo = latitudine, secondo =
 longitudine.
 
+- **Comune intero (nuovo)**: nella barra di ricerca scrivi il nome del comune
+  (es. `Formigine`, `Sassuolo`). L'app scarica il **confine reale** del comune
+  (frazioni comprese: Magreta, Colombaro, Casinalbo...) e lo disegna in giallo.
+  Premi **Avvia percorso**: la serpentina riempie **solo** quella forma, su e giù,
+  finché copre tutto. Tocca la mappa per tornare al cerchio manuale.
 - **Posizione fissa**: incolla lat e lng, premi **Imposta posizione fissa**.
 - **Percorso**: nella casella metti un punto per riga, es.
 

@@ -33,6 +33,7 @@ class MockLocationService : Service() {
         const val EXTRA_SQUARE = "square"
         const val EXTRA_SPEED_KMH = "speed_kmh"
         const val EXTRA_SERPENTINE = "serpentine"
+        const val EXTRA_BOUNDARY = "boundary"
         const val EXTRA_COV = "coverage"
         const val MODE_FIXED = "fixed"
         const val MODE_ROAM = "roam"
@@ -101,12 +102,17 @@ class MockLocationService : Service() {
         when (intent.getStringExtra(EXTRA_MODE)) {
             MODE_FIXED -> startFixed(lat, lng)
             MODE_ROAM -> {
-                val radius = intent.getIntExtra(EXTRA_RADIUS, 500)
-                val square = intent.getBooleanExtra(EXTRA_SQUARE, false)
                 val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 5.0)
-                val serpentine = intent.getBooleanExtra(EXTRA_SERPENTINE, true)
-                if (serpentine) startSweep(lat, lng, radius, square, speedKmh)
-                else startRandom(lat, lng, radius, square, speedKmh)
+                val boundary = intent.getStringExtra(EXTRA_BOUNDARY)
+                if (!boundary.isNullOrEmpty()) {
+                    startSweepBoundary(parseRings(boundary), speedKmh)
+                } else {
+                    val radius = intent.getIntExtra(EXTRA_RADIUS, 500)
+                    val square = intent.getBooleanExtra(EXTRA_SQUARE, false)
+                    val serpentine = intent.getBooleanExtra(EXTRA_SERPENTINE, true)
+                    if (serpentine) startSweep(lat, lng, radius, square, speedKmh)
+                    else startRandom(lat, lng, radius, square, speedKmh)
+                }
             }
             else -> stopSelf()
         }
@@ -130,7 +136,6 @@ class MockLocationService : Service() {
 
     private fun startSweep(cLat: Double, cLng: Double, radius: Int, square: Boolean, speedKmh: Double) {
         val speedMs = (speedKmh / 3.6).coerceAtLeast(0.3)
-        val stepM = speedMs * (UPDATE_MS / 1000.0)
         val cosLat = cos(Math.toRadians(cLat))
         val dLatMax = radius / METERS_PER_DEG
         val dLngMax = radius / (METERS_PER_DEG * cosLat)
@@ -163,7 +168,119 @@ class MockLocationService : Service() {
             return
         }
 
-        // lunghezza totale del percorso
+        walk(verts, speedMs, cosLat)
+        updateNotification("Serpentina avviata (r=${radius}m, ${speedKmh} km/h)")
+    }
+
+    // ---------------- serpentina dentro un confine reale (citta) ----------------
+
+    private fun startSweepBoundary(rings: List<List<DoubleArray>>, speedKmh: Double) {
+        if (rings.isEmpty()) {
+            updateNotification("Confine non valido")
+            stopSelf()
+            return
+        }
+        val speedMs = (speedKmh / 3.6).coerceAtLeast(0.3)
+
+        var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+        for (ring in rings) for (p in ring) {
+            if (p[0] < minLat) minLat = p[0]
+            if (p[0] > maxLat) maxLat = p[0]
+            if (p[1] < minLng) minLng = p[1]
+            if (p[1] > maxLng) maxLng = p[1]
+        }
+        val cLat = (minLat + maxLat) / 2.0
+        val cosLat = cos(Math.toRadians(cLat))
+
+        val verts = buildBoundaryVerts(rings, minLat, maxLat, minLng, maxLng, cosLat)
+        if (verts.size < 2) {
+            updateNotification("Confine troppo piccolo o non valido")
+            stopSelf()
+            return
+        }
+        walk(verts, speedMs, cosLat)
+        updateNotification("Serpentina citta avviata (${verts.size} punti, ${speedKmh} km/h)")
+    }
+
+    // corsie verticali (nord-sud) tagliate sul confine reale con regola even-odd
+    private fun buildBoundaryVerts(
+        rings: List<List<DoubleArray>>,
+        minLat: Double, maxLat: Double, minLng: Double, maxLng: Double,
+        cosLat: Double
+    ): ArrayList<DoubleArray> {
+        val out = ArrayList<DoubleArray>()
+        val spanLng = maxLng - minLng
+        if (spanLng <= 0 || maxLat <= minLat) return out
+        val widthM = spanLng * METERS_PER_DEG * cosLat
+        val laneSpacingM = Math.max(LANE_WIDTH_M, widthM / MAX_LANES)
+        val lanes = Math.max(2, Math.ceil(widthM / laneSpacingM).toInt())
+        val spacing = spanLng / lanes
+        for (li in 0 until lanes) {
+            val x = minLng + spacing * (li + 0.5)
+            val ys = scanline(rings, x)
+            if (ys.size < 2) continue
+            // coppie consecutive = intervalli dentro il poligono (even-odd)
+            val intervals = ArrayList<DoubleArray>()
+            var k = 0
+            while (k + 1 < ys.size) { intervals.add(doubleArrayOf(ys[k], ys[k + 1])); k += 2 }
+            if (intervals.isEmpty()) continue
+            if (li % 2 == 0) {
+                // dall'alto verso il basso
+                for (iv in intervals.indices.reversed()) {
+                    out.add(doubleArrayOf(intervals[iv][1], x))
+                    out.add(doubleArrayOf(intervals[iv][0], x))
+                }
+            } else {
+                for (iv in intervals.indices) {
+                    out.add(doubleArrayOf(intervals[iv][0], x))
+                    out.add(doubleArrayOf(intervals[iv][1], x))
+                }
+            }
+        }
+        return out
+    }
+
+    // latitudini dove la verticale lng=x incrocia tutti gli anelli (bordi + buchi)
+    private fun scanline(rings: List<List<DoubleArray>>, x: Double): DoubleArray {
+        val ys = ArrayList<Double>()
+        for (ring in rings) {
+            val n = ring.size
+            if (n < 2) continue
+            for (i in 0 until n) {
+                val a = ring[i]
+                val b = ring[(i + 1) % n]
+                val x1 = a[1]; val x2 = b[1]
+                if ((x1 <= x && x2 > x) || (x2 <= x && x1 > x)) {
+                    val t = (x - x1) / (x2 - x1)
+                    ys.add(a[0] + t * (b[0] - a[0]))
+                }
+            }
+        }
+        ys.sort()
+        return ys.toDoubleArray()
+    }
+
+    // decodifica "lat,lng lat,lng ; lat,lng ..." -> anelli
+    private fun parseRings(s: String): List<List<DoubleArray>> {
+        val rings = ArrayList<List<DoubleArray>>()
+        for (ringStr in s.split(';')) {
+            val pts = ArrayList<DoubleArray>()
+            for (pStr in ringStr.split(' ')) {
+                if (pStr.isBlank()) continue
+                val c = pStr.split(',')
+                if (c.size < 2) continue
+                val la = c[0].toDoubleOrNull() ?: continue
+                val ln = c[1].toDoubleOrNull() ?: continue
+                pts.add(doubleArrayOf(la, ln))
+            }
+            if (pts.size >= 3) rings.add(pts)
+        }
+        return rings
+    }
+
+    // motore di cammino condiviso: percorre i vertici a passo costante, ciclando
+    private fun walk(verts: List<DoubleArray>, speedMs: Double, cosLat: Double) {
+        val stepM = speedMs * (UPDATE_MS / 1000.0)
         var totalLen = 0.0
         for (i in 0 until verts.size - 1) totalLen += distM(verts[i], verts[i + 1], cosLat)
         if (totalLen <= 0) totalLen = 1.0
@@ -213,7 +330,6 @@ class MockLocationService : Service() {
                 sleep(UPDATE_MS)
             }
         }.also { it.start() }
-        updateNotification("Serpentina avviata (r=${radius}m, ${speedKmh} km/h)")
     }
 
     // ---------------- a caso ----------------

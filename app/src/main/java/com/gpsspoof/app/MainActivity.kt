@@ -19,15 +19,18 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
+import org.json.JSONObject
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.tileprovider.MapTileProviderBasic
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.TilesOverlay
@@ -35,6 +38,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 class MainActivity : Activity() {
@@ -61,6 +66,10 @@ class MainActivity : Activity() {
 
     private var posMarker: Marker? = null
     private var plannedLine: Polyline? = null
+
+    // confine reale del comune cercato (anelli). Se != null, roam usa questo al posto del cerchio.
+    private var boundaryRings: List<List<GeoPoint>>? = null
+    private val boundaryOverlays = ArrayList<Overlay>()
 
     private var receiverRegistered = false
     private val updateReceiver = object : BroadcastReceiver() {
@@ -182,6 +191,7 @@ class MainActivity : Activity() {
 
         val receiver = object : MapEventsReceiver {
             override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
+                if (boundaryRings != null) { boundaryRings = null; clearBoundaryOverlays() }
                 setCenter(p, false)
                 return true
             }
@@ -258,7 +268,16 @@ class MainActivity : Activity() {
 
     private fun updateEta() {
         val label = findViewById<TextView>(R.id.etaLabel) ?: return
-        label.text = formatEta(radiusMeters, isSquare, speedKmh)
+        val b = boundaryRings
+        if (b != null) {
+            val pts = buildSerpentineBoundary(b)
+            var m = 0.0
+            for (i in 1 until pts.size) m += distMeters(pts[i - 1], pts[i])
+            val speedMs = max(0.3, speedKmh / 3.6)
+            label.text = "Giro citta completo: ~${humanTime(m / speedMs)} (${"%.0f".format(m / 1000.0)} km)"
+        } else {
+            label.text = formatEta(radiusMeters, isSquare, speedKmh)
+        }
     }
 
     private fun shapePointsFor(cp: GeoPoint): List<GeoPoint> =
@@ -272,6 +291,7 @@ class MainActivity : Activity() {
     }
 
     private fun redraw(moveMap: Boolean) {
+        if (boundaryRings != null) { drawBoundary(moveMap); return }
         val cp = centerPoint ?: return
         centerMarker?.let { map.overlays.remove(it) }
         shapePolygon?.let { map.overlays.remove(it) }
@@ -345,6 +365,148 @@ class MainActivity : Activity() {
         return out
     }
 
+    // ---------------- confine reale del comune ----------------
+
+    private fun applyBoundary(rings: List<List<GeoPoint>>) {
+        boundaryRings = rings
+        var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+        for (ring in rings) for (p in ring) {
+            minLat = min(minLat, p.latitude); maxLat = max(maxLat, p.latitude)
+            minLng = min(minLng, p.longitude); maxLng = max(maxLng, p.longitude)
+        }
+        centerPoint = GeoPoint((minLat + maxLat) / 2.0, (minLng + maxLng) / 2.0)
+        // via cerchio/pin, mostra il confine
+        centerMarker?.let { map.overlays.remove(it) }; centerMarker = null
+        shapePolygon?.let { map.overlays.remove(it) }; shapePolygon = null
+        clearLiveOverlays()
+        drawBoundary(true)
+        updateEta()
+        setStatus("Confine citta pronto — premi Avvia percorso")
+    }
+
+    private fun clearBoundaryOverlays() {
+        for (o in boundaryOverlays) map.overlays.remove(o)
+        boundaryOverlays.clear()
+        map.invalidate()
+    }
+
+    private fun drawBoundary(moveMap: Boolean) {
+        clearBoundaryOverlays()
+        val rings = boundaryRings ?: return
+        var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+        for (ring in rings) {
+            val poly = Polygon(map)
+            poly.outlinePaint.color = Color.YELLOW
+            poly.outlinePaint.strokeWidth = 5f
+            poly.fillPaint.color = Color.argb(40, 0, 150, 255)
+            poly.points = ring
+            boundaryOverlays.add(poly)
+            map.overlays.add(poly)
+            for (p in ring) {
+                minLat = min(minLat, p.latitude); maxLat = max(maxLat, p.latitude)
+                minLng = min(minLng, p.longitude); maxLng = max(maxLng, p.longitude)
+            }
+        }
+        map.invalidate()
+        if (moveMap && maxLat > minLat) {
+            map.zoomToBoundingBox(BoundingBox(maxLat, maxLng, minLat, minLng), true, 80)
+        }
+    }
+
+    // stessa serpentina, ma tagliata sul confine reale (even-odd). Solo per disegno/ETA.
+    private fun buildSerpentineBoundary(rings: List<List<GeoPoint>>): List<GeoPoint> {
+        var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+        for (ring in rings) for (p in ring) {
+            minLat = min(minLat, p.latitude); maxLat = max(maxLat, p.latitude)
+            minLng = min(minLng, p.longitude); maxLng = max(maxLng, p.longitude)
+        }
+        val out = ArrayList<GeoPoint>()
+        val spanLng = maxLng - minLng
+        if (spanLng <= 0 || maxLat <= minLat) return out
+        val cLat = (minLat + maxLat) / 2.0
+        val cosLat = cos(Math.toRadians(cLat))
+        val widthM = spanLng * 111320.0 * cosLat
+        val laneSpacingM = max(laneWidthM, widthM / maxLanes)
+        val lanes = max(2, Math.ceil(widthM / laneSpacingM).toInt())
+        val spacing = spanLng / lanes
+        for (li in 0 until lanes) {
+            val x = minLng + spacing * (li + 0.5)
+            val ys = scanlineLat(rings, x)
+            if (ys.size < 2) continue
+            val intervals = ArrayList<DoubleArray>()
+            var k = 0
+            while (k + 1 < ys.size) { intervals.add(doubleArrayOf(ys[k], ys[k + 1])); k += 2 }
+            if (intervals.isEmpty()) continue
+            if (li % 2 == 0) {
+                for (iv in intervals.indices.reversed()) {
+                    out.add(GeoPoint(intervals[iv][1], x)); out.add(GeoPoint(intervals[iv][0], x))
+                }
+            } else {
+                for (iv in intervals.indices) {
+                    out.add(GeoPoint(intervals[iv][0], x)); out.add(GeoPoint(intervals[iv][1], x))
+                }
+            }
+        }
+        return out
+    }
+
+    private fun scanlineLat(rings: List<List<GeoPoint>>, x: Double): DoubleArray {
+        val ys = ArrayList<Double>()
+        for (ring in rings) {
+            val n = ring.size
+            if (n < 2) continue
+            for (i in 0 until n) {
+                val a = ring[i]
+                val b = ring[(i + 1) % n]
+                val x1 = a.longitude; val x2 = b.longitude
+                if ((x1 <= x && x2 > x) || (x2 <= x && x1 > x)) {
+                    val t = (x - x1) / (x2 - x1)
+                    ys.add(a.latitude + t * (b.latitude - a.latitude))
+                }
+            }
+        }
+        ys.sort()
+        return ys.toDoubleArray()
+    }
+
+    private fun encodeRings(rings: List<List<GeoPoint>>): String =
+        rings.joinToString(";") { ring ->
+            ring.joinToString(" ") { p -> "${p.latitude},${p.longitude}" }
+        }
+
+    private fun distMeters(a: GeoPoint, b: GeoPoint): Double {
+        val cosLat = cos(Math.toRadians(a.latitude))
+        val dxm = (b.longitude - a.longitude) * 111320.0 * cosLat
+        val dym = (b.latitude - a.latitude) * 111320.0
+        return Math.hypot(dxm, dym)
+    }
+
+    // GeoJSON (Polygon / MultiPolygon) -> lista di anelli in GeoPoint
+    private fun parseGeoJson(gj: JSONObject): List<List<GeoPoint>>? {
+        val type = gj.optString("type")
+        val coords = gj.optJSONArray("coordinates") ?: return null
+        val rings = ArrayList<List<GeoPoint>>()
+        when (type) {
+            "Polygon" -> parsePolygon(coords, rings)
+            "MultiPolygon" -> for (i in 0 until coords.length()) parsePolygon(coords.getJSONArray(i), rings)
+            else -> return null
+        }
+        return if (rings.isEmpty()) null else rings
+    }
+
+    private fun parsePolygon(polyCoords: JSONArray, out: ArrayList<List<GeoPoint>>) {
+        for (r in 0 until polyCoords.length()) {
+            val ringArr = polyCoords.getJSONArray(r)
+            val pts = ArrayList<GeoPoint>()
+            for (k in 0 until ringArr.length()) {
+                val c = ringArr.getJSONArray(k)
+                val lng = c.getDouble(0); val lat = c.getDouble(1)
+                pts.add(GeoPoint(lat, lng))
+            }
+            if (pts.size >= 3) out.add(pts)
+        }
+    }
+
     // ---------------- live overlays ----------------
 
     private fun ensurePosMarker() {
@@ -360,9 +522,13 @@ class MainActivity : Activity() {
     private fun drawPlanned(serpentine: Boolean) {
         plannedLine?.let { map.overlays.remove(it) }
         plannedLine = null
-        val cp = centerPoint ?: return
-        if (!serpentine) return
-        val pts = buildSerpentine(cp, radiusMeters, isSquare)
+        val pts: List<GeoPoint> = if (boundaryRings != null) {
+            buildSerpentineBoundary(boundaryRings!!)
+        } else {
+            val cp = centerPoint ?: return
+            if (!serpentine) return
+            buildSerpentine(cp, radiusMeters, isSquare)
+        }
         if (pts.size < 2) return
         val pl = Polyline(map)
         pl.outlinePaint.color = Color.argb(200, 255, 0, 0)
@@ -392,23 +558,41 @@ class MainActivity : Activity() {
         Thread {
             try {
                 val q = URLEncoder.encode(query, "UTF-8")
-                val url = URL("https://nominatim.openstreetmap.org/search?q=$q&format=json&limit=1")
+                val url = URL(
+                    "https://nominatim.openstreetmap.org/search?q=$q&format=json" +
+                        "&polygon_geojson=1&polygon_threshold=0.0004&limit=5"
+                )
                 val conn = url.openConnection() as HttpURLConnection
                 conn.setRequestProperty("User-Agent", "gps-spoof-app/1.0")
                 conn.connectTimeout = 12000
                 conn.readTimeout = 12000
                 val txt = conn.inputStream.bufferedReader().use { it.readText() }
                 val arr = JSONArray(txt)
-                if (arr.length() > 0) {
-                    val o = arr.getJSONObject(0)
-                    val lat = o.getString("lat").toDouble()
-                    val lon = o.getString("lon").toDouble()
-                    runOnUiThread {
-                        map.controller.setZoom(15.0)
-                        setCenter(GeoPoint(lat, lon), true)
+                var chosen: List<List<GeoPoint>>? = null
+                var fLat = Double.NaN; var fLng = Double.NaN
+                for (idx in 0 until arr.length()) {
+                    val o = arr.getJSONObject(idx)
+                    if (fLat.isNaN()) {
+                        fLat = o.getString("lat").toDouble()
+                        fLng = o.getString("lon").toDouble()
                     }
-                } else {
-                    runOnUiThread { toast("Non trovato: $query") }
+                    val gj = o.optJSONObject("geojson") ?: continue
+                    val rings = parseGeoJson(gj) ?: continue
+                    chosen = rings
+                    break
+                }
+                val foundRings = chosen
+                val okLat = fLat; val okLng = fLng
+                runOnUiThread {
+                    when {
+                        foundRings != null -> applyBoundary(foundRings)
+                        !okLat.isNaN() -> {
+                            boundaryRings = null; clearBoundaryOverlays()
+                            map.controller.setZoom(15.0)
+                            setCenter(GeoPoint(okLat, okLng), true)
+                        }
+                        else -> toast("Non trovato: $query")
+                    }
                 }
             } catch (e: Exception) {
                 runOnUiThread { toast("Errore ricerca: ${e.message}") }
@@ -432,8 +616,27 @@ class MainActivity : Activity() {
     }
 
     private fun startRoam() {
-        val cp = centerPoint ?: return
         if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+
+        val b = boundaryRings
+        if (b != null) {
+            val cp = centerPoint ?: return
+            clearLiveOverlays()
+            drawPlanned(true)
+            val i = Intent(this, MockLocationService::class.java).apply {
+                putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_ROAM)
+                putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
+                putExtra(MockLocationService.EXTRA_LNG, cp.longitude)
+                putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
+                putExtra(MockLocationService.EXTRA_SERPENTINE, true)
+                putExtra(MockLocationService.EXTRA_BOUNDARY, encodeRings(b))
+            }
+            startForegroundService(i)
+            setStatus("Serpentina citta avviata ($speedKmh km/h)")
+            return
+        }
+
+        val cp = centerPoint ?: return
         val serpentine = findViewById<Switch>(R.id.sweepSwitch).isChecked
         clearLiveOverlays()
         drawPlanned(serpentine)
