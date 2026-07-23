@@ -35,9 +35,20 @@ class MockLocationService : Service() {
         const val EXTRA_SERPENTINE = "serpentine"
         const val EXTRA_BOUNDARY = "boundary"
         const val EXTRA_COV = "coverage"
+        const val EXTRA_REMAINING = "remaining_secs"
+        const val EXTRA_START_TRAVELED = "start_traveled"
+        const val EXTRA_SIG = "sig"
         const val MODE_FIXED = "fixed"
         const val MODE_ROAM = "roam"
         const val ACTION_UPDATE = "com.gpsspoof.app.UPDATE"
+
+        // progresso salvato: sopravvive a stop/chiusura app -> permette la ripresa
+        const val PROGRESS_PREFS = "spoof_progress"
+        const val KEY_SIG = "sig"
+        const val KEY_TRAVELED = "traveled"
+        const val KEY_TOTAL = "total"
+        const val KEY_LAT = "lat"
+        const val KEY_LNG = "lng"
 
         private const val CHANNEL_ID = "gps_spoof"
         private const val NOTIF_ID = 1
@@ -103,14 +114,16 @@ class MockLocationService : Service() {
             MODE_FIXED -> startFixed(lat, lng)
             MODE_ROAM -> {
                 val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 5.0)
+                val startTraveled = intent.getDoubleExtra(EXTRA_START_TRAVELED, 0.0)
+                val sig = intent.getStringExtra(EXTRA_SIG) ?: ""
                 val boundary = intent.getStringExtra(EXTRA_BOUNDARY)
                 if (!boundary.isNullOrEmpty()) {
-                    startSweepBoundary(parseRings(boundary), speedKmh)
+                    startSweepBoundary(parseRings(boundary), speedKmh, startTraveled, sig)
                 } else {
                     val radius = intent.getIntExtra(EXTRA_RADIUS, 500)
                     val square = intent.getBooleanExtra(EXTRA_SQUARE, false)
                     val serpentine = intent.getBooleanExtra(EXTRA_SERPENTINE, true)
-                    if (serpentine) startSweep(lat, lng, radius, square, speedKmh)
+                    if (serpentine) startSweep(lat, lng, radius, square, speedKmh, startTraveled, sig)
                     else startRandom(lat, lng, radius, square, speedKmh)
                 }
             }
@@ -134,7 +147,7 @@ class MockLocationService : Service() {
 
     // ---------------- serpentina (su/giu) ----------------
 
-    private fun startSweep(cLat: Double, cLng: Double, radius: Int, square: Boolean, speedKmh: Double) {
+    private fun startSweep(cLat: Double, cLng: Double, radius: Int, square: Boolean, speedKmh: Double, startTraveled: Double, sig: String) {
         val speedMs = (speedKmh / 3.6).coerceAtLeast(0.3)
         val cosLat = cos(Math.toRadians(cLat))
         val dLatMax = radius / METERS_PER_DEG
@@ -168,13 +181,13 @@ class MockLocationService : Service() {
             return
         }
 
-        walk(verts, speedMs, cosLat)
+        walk(verts, speedMs, cosLat, startTraveled, sig)
         updateNotification("Serpentina avviata (r=${radius}m, ${speedKmh} km/h)")
     }
 
     // ---------------- serpentina dentro un confine reale (citta) ----------------
 
-    private fun startSweepBoundary(rings: List<List<DoubleArray>>, speedKmh: Double) {
+    private fun startSweepBoundary(rings: List<List<DoubleArray>>, speedKmh: Double, startTraveled: Double, sig: String) {
         if (rings.isEmpty()) {
             updateNotification("Confine non valido")
             stopSelf()
@@ -198,7 +211,7 @@ class MockLocationService : Service() {
             stopSelf()
             return
         }
-        walk(verts, speedMs, cosLat)
+        walk(verts, speedMs, cosLat, startTraveled, sig)
         updateNotification("Serpentina citta avviata (${verts.size} punti, ${speedKmh} km/h)")
     }
 
@@ -278,18 +291,37 @@ class MockLocationService : Service() {
         return rings
     }
 
-    // motore di cammino condiviso: percorre i vertici a passo costante, ciclando
-    private fun walk(verts: List<DoubleArray>, speedMs: Double, cosLat: Double) {
+    // motore di cammino condiviso: percorre i vertici a passo costante, ciclando.
+    // startTraveled = metri gia percorsi in un giro precedente (ripresa da posizione salvata).
+    private fun walk(verts: List<DoubleArray>, speedMs: Double, cosLat: Double, startTraveled: Double, sig: String) {
         val stepM = speedMs * (UPDATE_MS / 1000.0)
         var totalLen = 0.0
         for (i in 0 until verts.size - 1) totalLen += distM(verts[i], verts[i + 1], cosLat)
         if (totalLen <= 0) totalLen = 1.0
+        val total = totalLen
 
         running = true
         worker = Thread {
             var seg = 0
             var cur = doubleArrayOf(verts[0][0], verts[0][1])
             var traveled = 0.0
+
+            // ripresa: avanza fino al punto salvato prima di iniziare a spingere posizioni
+            val startAt = if (startTraveled > 0) startTraveled % total else 0.0
+            if (startAt > 0) {
+                var acc = 0.0
+                while (seg < verts.size - 1) {
+                    val a = verts[seg]; val b = verts[seg + 1]
+                    val segLen = distM(a, b, cosLat)
+                    if (acc + segLen >= startAt) {
+                        val f = if (segLen > 0) (startAt - acc) / segLen else 0.0
+                        cur = doubleArrayOf(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f)
+                        traveled = startAt
+                        break
+                    }
+                    acc += segLen; seg++
+                }
+            }
             var lastBearing = 0f
 
             while (running) {
@@ -322,14 +354,30 @@ class MockLocationService : Service() {
                     }
                 }
 
-                val cov = (traveled * 100 / totalLen).toInt().coerceIn(0, 100)
+                val cov = (traveled * 100 / total).toInt().coerceIn(0, 100)
+                val remainingSecs = ((total - traveled) / speedMs).toLong().coerceAtLeast(0)
                 push(cur[0], cur[1], speedMs.toFloat(), lastBearing)
-                broadcast(cur[0], cur[1], cov)
+                saveProgress(sig, traveled, total, cur[0], cur[1])
+                broadcast(cur[0], cur[1], cov, remainingSecs)
                 if (traveled < stepM) updateNotification("Serpentina: nuovo giro")
                 else updateNotification("Serpentina: completato $cov%")
                 sleep(UPDATE_MS)
             }
         }.also { it.start() }
+    }
+
+    // salva il progresso ogni secondo: se l'app viene chiusa o fermata, si puo riprendere da qui
+    private fun saveProgress(sig: String, traveled: Double, total: Double, lat: Double, lng: Double) {
+        try {
+            getSharedPreferences(PROGRESS_PREFS, Context.MODE_PRIVATE).edit()
+                .putString(KEY_SIG, sig)
+                .putLong(KEY_TRAVELED, java.lang.Double.doubleToRawLongBits(traveled))
+                .putLong(KEY_TOTAL, java.lang.Double.doubleToRawLongBits(total))
+                .putLong(KEY_LAT, java.lang.Double.doubleToRawLongBits(lat))
+                .putLong(KEY_LNG, java.lang.Double.doubleToRawLongBits(lng))
+                .apply()
+        } catch (e: Exception) {
+        }
     }
 
     // ---------------- a caso ----------------
@@ -450,11 +498,12 @@ class MockLocationService : Service() {
         return x
     }
 
-    private fun broadcast(lat: Double, lng: Double, cov: Int) {
+    private fun broadcast(lat: Double, lng: Double, cov: Int, remainingSecs: Long = -1L) {
         val up = Intent(ACTION_UPDATE).setPackage(packageName)
         up.putExtra(EXTRA_LAT, lat)
         up.putExtra(EXTRA_LNG, lng)
         up.putExtra(EXTRA_COV, cov)
+        up.putExtra(EXTRA_REMAINING, remainingSecs)
         sendBroadcast(up)
     }
 

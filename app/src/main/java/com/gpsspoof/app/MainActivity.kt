@@ -2,6 +2,7 @@ package com.gpsspoof.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -15,7 +16,6 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.SeekBar
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
@@ -32,7 +32,6 @@ import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polygon
-import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.TilesOverlay
 import java.net.HttpURLConnection
 import java.net.URL
@@ -65,7 +64,7 @@ class MainActivity : Activity() {
     private var shapePolygon: Polygon? = null
 
     private var posMarker: Marker? = null
-    private var plannedLine: Polyline? = null
+    private val plannedOverlays = ArrayList<Overlay>()
 
     // confine reale del comune cercato (anelli). Se != null, roam usa questo al posto del cerchio.
     private var boundaryRings: List<List<GeoPoint>>? = null
@@ -78,11 +77,17 @@ class MainActivity : Activity() {
             val lat = i.getDoubleExtra(MockLocationService.EXTRA_LAT, Double.NaN)
             val lng = i.getDoubleExtra(MockLocationService.EXTRA_LNG, Double.NaN)
             val cov = i.getIntExtra(MockLocationService.EXTRA_COV, -1)
+            val remaining = i.getLongExtra(MockLocationService.EXTRA_REMAINING, -1L)
             if (lat.isNaN() || lng.isNaN()) return
             ensurePosMarker()
             posMarker?.position = GeoPoint(lat, lng)
             map.invalidate()
             if (cov >= 0) setStatus("In movimento — completato $cov%")
+            // countdown vero: il tempo rimanente scende ad ogni secondo
+            if (remaining >= 0) {
+                findViewById<TextView>(R.id.etaLabel)?.text =
+                    "Giro al $cov% — mancano ${humanTime(remaining.toDouble())}"
+            }
         }
     }
 
@@ -107,7 +112,6 @@ class MainActivity : Activity() {
         val radiusLabel = findViewById<TextView>(R.id.radiusLabel)
         val speedSeek = findViewById<SeekBar>(R.id.speedSeek)
         val speedLabel = findViewById<TextView>(R.id.speedLabel)
-        val shapeSwitch = findViewById<Switch>(R.id.shapeSwitch)
         val searchInput = findViewById<EditText>(R.id.searchInput)
 
         radiusSeek.max = radiusSteps
@@ -132,12 +136,6 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
-        shapeSwitch.setOnCheckedChangeListener { _, checked ->
-            isSquare = checked
-            redraw(false)
-            updateEta()
-        }
-
         updateEta()
 
         findViewById<Button>(R.id.searchButton).setOnClickListener {
@@ -152,10 +150,32 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.fixedButton).setOnClickListener { startFixed() }
         findViewById<Button>(R.id.roamButton).setOnClickListener { startRoam() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
-            stopService(Intent(this, MockLocationService::class.java))
-            clearLiveOverlays()
-            setStatus("Fermo")
+            askStopConfirm(1)
         }
+    }
+
+    // STOP protetto: 5 conferme di fila. Basta un "No" o chiudere (X / fuori / indietro)
+    // per NON fermare. Solo il 5° "Si" ferma davvero: evita gli stop per sbaglio.
+    private fun askStopConfirm(step: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("Fermare lo spoof? ($step di 5)")
+            .setMessage(
+                if (step < 5) "Vuoi VERAMENTE fermare?\nDevi confermare 5 volte. Manca ancora ${5 - step + 1}."
+                else "ULTIMA conferma.\nPremi Si e lo spoof si ferma DAVVERO."
+            )
+            .setPositiveButton("Si") { _, _ ->
+                if (step >= 5) doStop() else askStopConfirm(step + 1)
+            }
+            .setNegativeButton("No") { d, _ -> d.dismiss() }  // non ferma
+            .setCancelable(true)                               // X / fuori / indietro = non ferma
+            .show()
+    }
+
+    private fun doStop() {
+        stopService(Intent(this, MockLocationService::class.java))
+        clearLiveOverlays()
+        setStatus("Fermo")
+        toast("Spoof fermato")
     }
 
     // ---------------- map ----------------
@@ -519,30 +539,45 @@ class MainActivity : Activity() {
         }
     }
 
+    // area coperta disegnata PIENA di rosso: niente linee staccate, niente pixel fuori.
+    // riempie esattamente la zona percorsa (confine citta o cerchio) = tutto attaccato.
     private fun drawPlanned(serpentine: Boolean) {
-        plannedLine?.let { map.overlays.remove(it) }
-        plannedLine = null
-        val pts: List<GeoPoint> = if (boundaryRings != null) {
-            buildSerpentineBoundary(boundaryRings!!)
+        clearPlannedOverlays()
+        val b = boundaryRings
+        if (b != null) {
+            for (ring in b) {
+                if (ring.size < 3) continue
+                val poly = Polygon(map)
+                poly.outlinePaint.color = Color.argb(255, 200, 0, 0)
+                poly.outlinePaint.strokeWidth = 3f
+                poly.fillPaint.color = Color.argb(150, 220, 0, 0)
+                poly.points = ring
+                plannedOverlays.add(poly)
+                map.overlays.add(poly)
+            }
         } else {
             val cp = centerPoint ?: return
-            if (!serpentine) return
-            buildSerpentine(cp, radiusMeters, isSquare)
+            val poly = Polygon(map)
+            poly.outlinePaint.color = Color.argb(255, 200, 0, 0)
+            poly.outlinePaint.strokeWidth = 3f
+            poly.fillPaint.color = Color.argb(150, 220, 0, 0)
+            poly.points = shapePointsFor(cp)
+            plannedOverlays.add(poly)
+            map.overlays.add(poly)
         }
-        if (pts.size < 2) return
-        val pl = Polyline(map)
-        pl.outlinePaint.color = Color.argb(200, 255, 0, 0)
-        pl.outlinePaint.strokeWidth = 16f
-        pl.setPoints(pts)
-        plannedLine = pl
-        map.overlays.add(pl)
+        // pin sopra il rosso, cosi restano visibili
+        posMarker?.let { map.overlays.remove(it); map.overlays.add(it) }
         map.invalidate()
     }
 
+    private fun clearPlannedOverlays() {
+        for (o in plannedOverlays) map.overlays.remove(o)
+        plannedOverlays.clear()
+    }
+
     private fun clearLiveOverlays() {
-        plannedLine?.let { map.overlays.remove(it) }
+        clearPlannedOverlays()
         posMarker?.let { map.overlays.remove(it) }
-        plannedLine = null
         posMarker = null
         map.invalidate()
     }
@@ -617,40 +652,83 @@ class MainActivity : Activity() {
 
     private fun startRoam() {
         if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+        if (boundaryRings == null && centerPoint == null) return
 
-        val b = boundaryRings
-        if (b != null) {
-            val cp = centerPoint ?: return
-            clearLiveOverlays()
-            drawPlanned(true)
-            val i = Intent(this, MockLocationService::class.java).apply {
-                putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_ROAM)
-                putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
-                putExtra(MockLocationService.EXTRA_LNG, cp.longitude)
-                putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
-                putExtra(MockLocationService.EXTRA_SERPENTINE, true)
-                putExtra(MockLocationService.EXTRA_BOUNDARY, encodeRings(b))
+        val sig = computeSig()
+        val p = getSharedPreferences(MockLocationService.PROGRESS_PREFS, Context.MODE_PRIVATE)
+        val savedSig = p.getString(MockLocationService.KEY_SIG, null)
+        val traveled = if (p.contains(MockLocationService.KEY_TRAVELED))
+            java.lang.Double.longBitsToDouble(p.getLong(MockLocationService.KEY_TRAVELED, 0)) else 0.0
+        val total = if (p.contains(MockLocationService.KEY_TOTAL))
+            java.lang.Double.longBitsToDouble(p.getLong(MockLocationService.KEY_TOTAL, 0)) else 0.0
+        val hasSaved = savedSig == sig && traveled > 1.0 && total > 0.0
+        val pct = if (total > 0.0) (traveled * 100 / total).toInt().coerceIn(0, 100) else 0
+
+        if (!hasSaved) { doStartRoam(0.0, sig); return }
+
+        // c'e' un giro salvato di questa stessa zona: chiedi da zero o ripresa
+        AlertDialog.Builder(this)
+            .setTitle("Ripartire da zero?")
+            .setMessage("Hai gia un giro salvato al $pct%.\nVuoi RICOMINCIARE tutto da zero?")
+            .setPositiveButton("Si, da zero") { _, _ -> clearProgress(); doStartRoam(0.0, sig) }
+            .setNegativeButton("No") { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle("Riprendo da dove eri")
+                    .setMessage("Ottimo! Riparto dall'ultima posizione salvata (sei al $pct%).")
+                    .setPositiveButton("Si, riprendi") { _, _ -> doStartRoam(traveled, sig) }
+                    .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
+                    .setCancelable(true)
+                    .show()
             }
-            startForegroundService(i)
-            setStatus("Serpentina citta avviata ($speedKmh km/h)")
-            return
-        }
+            .setCancelable(true)
+            .show()
+    }
 
+    // avvia davvero la serpentina. startTraveled>0 = ripresa dal punto salvato.
+    private fun doStartRoam(startTraveled: Double, sig: String) {
         val cp = centerPoint ?: return
-        val serpentine = findViewById<Switch>(R.id.sweepSwitch).isChecked
         clearLiveOverlays()
-        drawPlanned(serpentine)
+        drawPlanned(true)
+        val b = boundaryRings
         val i = Intent(this, MockLocationService::class.java).apply {
             putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_ROAM)
             putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
             putExtra(MockLocationService.EXTRA_LNG, cp.longitude)
-            putExtra(MockLocationService.EXTRA_RADIUS, radiusMeters)
-            putExtra(MockLocationService.EXTRA_SQUARE, isSquare)
             putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
-            putExtra(MockLocationService.EXTRA_SERPENTINE, serpentine)
+            putExtra(MockLocationService.EXTRA_SERPENTINE, true)
+            putExtra(MockLocationService.EXTRA_START_TRAVELED, startTraveled)
+            putExtra(MockLocationService.EXTRA_SIG, sig)
+            if (b != null) {
+                putExtra(MockLocationService.EXTRA_BOUNDARY, encodeRings(b))
+            } else {
+                putExtra(MockLocationService.EXTRA_RADIUS, radiusMeters)
+                putExtra(MockLocationService.EXTRA_SQUARE, false)
+            }
         }
         startForegroundService(i)
-        setStatus("Avviato ($speedKmh km/h, $radiusMeters m)")
+        val resume = if (startTraveled > 0) " — RIPRESA" else ""
+        setStatus(if (b != null) "Serpentina citta avviata$resume ($speedKmh km/h)"
+                  else "Avviato$resume ($speedKmh km/h, $radiusMeters m)")
+    }
+
+    // firma della zona: distingue un giro salvato per confine citta o per cerchio
+    private fun computeSig(): String {
+        val b = boundaryRings
+        if (b != null) {
+            var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+            for (ring in b) for (pt in ring) {
+                minLat = min(minLat, pt.latitude); maxLat = max(maxLat, pt.latitude)
+                minLng = min(minLng, pt.longitude); maxLng = max(maxLng, pt.longitude)
+            }
+            return "b:%.4f,%.4f,%.4f,%.4f".format(minLat, minLng, maxLat, maxLng)
+        }
+        val cp = centerPoint ?: return "none"
+        return "c:%.5f,%.5f,r%d".format(cp.latitude, cp.longitude, radiusMeters)
+    }
+
+    private fun clearProgress() {
+        getSharedPreferences(MockLocationService.PROGRESS_PREFS, Context.MODE_PRIVATE)
+            .edit().clear().apply()
     }
 
     // ---------------- misc ----------------
