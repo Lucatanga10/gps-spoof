@@ -126,6 +126,8 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
+        // velocita fino a 5000 km/h per la modalita walk / roam turbo simulato
+        speedSeek.max = 5000
         speedSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                 speedKmh = p.coerceAtLeast(1)
@@ -149,6 +151,8 @@ class MainActivity : Activity() {
 
         findViewById<Button>(R.id.fixedButton).setOnClickListener { startFixed() }
         findViewById<Button>(R.id.roamButton).setOnClickListener { startRoam() }
+        findViewById<Button>(R.id.turboButton)?.setOnClickListener { startTurbo() }
+        findViewById<Button>(R.id.walkButton)?.setOnClickListener { startWalk() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             askStopConfirm(1)
         }
@@ -709,6 +713,72 @@ class MainActivity : Activity() {
         val resume = if (startTraveled > 0) " — RIPRESA" else ""
         setStatus(if (b != null) "Serpentina citta avviata$resume ($speedKmh km/h)"
                   else "Avviato$resume ($speedKmh km/h, $radiusMeters m)")
+    }
+
+    // ---------------- TURBO: teleport hex-by-hex ----------------
+
+    private fun startTurbo() {
+        if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+        val cp = centerPoint ?: return
+        clearLiveOverlays()
+        drawPlanned(true)
+        val b = boundaryRings
+        val sig = "turbo:" + computeSig()
+        val i = Intent(this, MockLocationService::class.java).apply {
+            putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_TURBO)
+            putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
+            putExtra(MockLocationService.EXTRA_LNG, cp.longitude)
+            putExtra(MockLocationService.EXTRA_SIG, sig)
+            putExtra(MockLocationService.EXTRA_HEX_STEP, 130.0)
+            putExtra(MockLocationService.EXTRA_PUSH_MS, 150L)
+            if (b != null) {
+                putExtra(MockLocationService.EXTRA_BOUNDARY, encodeRings(b))
+            } else {
+                putExtra(MockLocationService.EXTRA_RADIUS, radiusMeters)
+            }
+        }
+        startForegroundService(i)
+        setStatus("TURBO avviato — teleport hex-by-hex (~6-8 hex/sec)")
+    }
+
+    // ---------------- WALK: cammino graduale da casa al target ----------------
+
+    private fun startWalk() {
+        if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+        val cp = centerPoint ?: return
+        // "from" = ultima posizione reale conosciuta del telefono; se non disponibile, default Modena
+        val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        var fromLat = 44.6469; var fromLng = 10.9252
+        try {
+            val real = lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.PASSIVE_PROVIDER)
+            if (real != null) { fromLat = real.latitude; fromLng = real.longitude }
+        } catch (e: Exception) {
+        }
+        clearLiveOverlays()
+        val distKm = distMeters(GeoPoint(fromLat, fromLng), cp) / 1000.0
+        val etaH = distKm / speedKmh
+        AlertDialog.Builder(this)
+            .setTitle("Walk verso destinazione")
+            .setMessage("Cammino da (${"%.4f".format(fromLat)}, ${"%.4f".format(fromLng)}) a destinazione.\n" +
+                "Distanza: ${"%.1f".format(distKm)} km a $speedKmh km/h.\n" +
+                "ETA: ${"%.1f".format(etaH)} ore.\n\n" +
+                "Serve per costruire fiducia in Bump prima di grattare zone lontane.")
+            .setPositiveButton("Avvia") { _, _ ->
+                val i = Intent(this, MockLocationService::class.java).apply {
+                    putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_WALK)
+                    putExtra(MockLocationService.EXTRA_LAT, cp.latitude)
+                    putExtra(MockLocationService.EXTRA_LNG, cp.longitude)
+                    putExtra(MockLocationService.EXTRA_WALK_FROM_LAT, fromLat)
+                    putExtra(MockLocationService.EXTRA_WALK_FROM_LNG, fromLng)
+                    putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
+                }
+                startForegroundService(i)
+                setStatus("WALK avviato: ${"%.1f".format(distKm)} km, ETA ${"%.1f".format(etaH)}h")
+            }
+            .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
+            .show()
     }
 
     // firma della zona: distingue un giro salvato per confine citta o per cerchio

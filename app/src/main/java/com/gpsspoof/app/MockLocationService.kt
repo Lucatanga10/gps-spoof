@@ -38,8 +38,14 @@ class MockLocationService : Service() {
         const val EXTRA_REMAINING = "remaining_secs"
         const val EXTRA_START_TRAVELED = "start_traveled"
         const val EXTRA_SIG = "sig"
+        const val EXTRA_HEX_STEP = "hex_step"
+        const val EXTRA_PUSH_MS = "push_ms"
+        const val EXTRA_WALK_FROM_LAT = "walk_from_lat"
+        const val EXTRA_WALK_FROM_LNG = "walk_from_lng"
         const val MODE_FIXED = "fixed"
         const val MODE_ROAM = "roam"
+        const val MODE_TURBO = "turbo"
+        const val MODE_WALK = "walk"
         const val ACTION_UPDATE = "com.gpsspoof.app.UPDATE"
 
         // progresso salvato: sopravvive a stop/chiusura app -> permette la ripresa
@@ -52,13 +58,18 @@ class MockLocationService : Service() {
 
         private const val CHANNEL_ID = "gps_spoof"
         private const val NOTIF_ID = 1
+        // ROAM SERPENTINA: intatto rispetto alla versione originale, cammino continuo
         private const val UPDATE_MS = 1000L
         private const val METERS_PER_DEG = 111320.0
         private const val GRID_N = 40
 
-        // corsie serpentina: devono combaciare con MainActivity (attaccate, con tetto)
+        // corsie serpentina originali (8m attaccate) — non toccare, motore Bump funziona cosi
         private const val LANE_WIDTH_M = 8.0
         private const val MAX_LANES = 4000
+
+        // turbo hex grid: passo default. 130m sicuro per H3 res 9 (max diametro ~348m -> spacing < 300m ok)
+        private const val DEFAULT_HEX_STEP_M = 130.0
+        private const val DEFAULT_TURBO_MS = 150L
     }
 
     private lateinit var lm: LocationManager
@@ -70,7 +81,8 @@ class MockLocationService : Service() {
 
     private val testProviders = listOf(
         LocationManager.GPS_PROVIDER,
-        LocationManager.NETWORK_PROVIDER
+        LocationManager.NETWORK_PROVIDER,
+        LocationManager.PASSIVE_PROVIDER
     )
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -126,6 +138,21 @@ class MockLocationService : Service() {
                     if (serpentine) startSweep(lat, lng, radius, square, speedKmh, startTraveled, sig)
                     else startRandom(lat, lng, radius, square, speedKmh)
                 }
+            }
+            MODE_TURBO -> {
+                val sig = intent.getStringExtra(EXTRA_SIG) ?: ""
+                val boundary = intent.getStringExtra(EXTRA_BOUNDARY)
+                val hexStep = intent.getDoubleExtra(EXTRA_HEX_STEP, DEFAULT_HEX_STEP_M)
+                val pushMs = intent.getLongExtra(EXTRA_PUSH_MS, DEFAULT_TURBO_MS)
+                val rings = if (!boundary.isNullOrEmpty()) parseRings(boundary)
+                            else buildCircleRing(lat, lng, intent.getIntExtra(EXTRA_RADIUS, 500))
+                startTurbo(rings, hexStep, pushMs, sig)
+            }
+            MODE_WALK -> {
+                val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 120.0)
+                val fromLat = intent.getDoubleExtra(EXTRA_WALK_FROM_LAT, lat)
+                val fromLng = intent.getDoubleExtra(EXTRA_WALK_FROM_LNG, lng)
+                startWalk(fromLat, fromLng, lat, lng, speedKmh)
             }
             else -> stopSelf()
         }
@@ -215,6 +242,135 @@ class MockLocationService : Service() {
         updateNotification("Serpentina citta avviata (${verts.size} punti, ${speedKmh} km/h)")
     }
 
+    // ---------------- TURBO: teleport hex-by-hex, 1 push = 1 esagono grattato ----------------
+
+    // enumerare griglia esagonale dentro il poligono, iterare in serpentina, push center di ogni cella.
+    // niente cammino, niente interpolazione: ogni tick = 1 esagono nuovo garantito.
+    private fun startTurbo(rings: List<List<DoubleArray>>, hexStepM: Double, pushMs: Long, sig: String) {
+        val stepM = if (hexStepM > 20.0) hexStepM else DEFAULT_HEX_STEP_M
+        val tickMs = if (pushMs in 30..5000) pushMs else DEFAULT_TURBO_MS
+
+        var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+        for (ring in rings) for (p in ring) {
+            if (p[0] < minLat) minLat = p[0]; if (p[0] > maxLat) maxLat = p[0]
+            if (p[1] < minLng) minLng = p[1]; if (p[1] > maxLng) maxLng = p[1]
+        }
+        if (maxLat <= minLat || maxLng <= minLng) { stopSelf(); return }
+        val cLat = (minLat + maxLat) / 2.0
+        val cosLat = cos(Math.toRadians(cLat))
+        val stepLat = stepM / METERS_PER_DEG
+        val stepLng = stepM / (METERS_PER_DEG * cosLat)
+        val rowHeight = stepLat * 0.866  // sqrt(3)/2 per griglia esagonale piena
+
+        // costruisci punti: righe sfalsate stile hex-grid, filtro point-in-polygon, serpentina
+        val points = ArrayList<DoubleArray>()
+        var lat = minLat
+        var row = 0
+        while (lat <= maxLat) {
+            val rowPts = ArrayList<DoubleArray>()
+            var lng = minLng + (if (row % 2 == 1) stepLng / 2.0 else 0.0)
+            while (lng <= maxLng) {
+                if (pointInRings(lat, lng, rings)) rowPts.add(doubleArrayOf(lat, lng))
+                lng += stepLng
+            }
+            if (row % 2 == 1) rowPts.reverse()  // serpentina alterna direzione
+            points.addAll(rowPts)
+            lat += rowHeight
+            row++
+        }
+
+        if (points.isEmpty()) {
+            updateNotification("Turbo: nessun esagono dentro il confine")
+            stopSelf(); return
+        }
+
+        val totalHex = points.size
+        running = true
+        worker = Thread {
+            var idx = 0
+            var lastBearing = 0f
+            while (running) {
+                val p = points[idx]
+                if (idx > 0) {
+                    val prev = points[idx - 1]
+                    lastBearing = bearingOf(prev, p, cosLat)
+                }
+                push(p[0], p[1], 30f, lastBearing)  // speed 30 m/s finta (auto in citta)
+                saveProgress(sig, idx.toDouble(), totalHex.toDouble(), p[0], p[1])
+                val cov = (idx * 100 / totalHex).coerceIn(0, 100)
+                val remaining = ((totalHex - idx).toLong() * tickMs / 1000L)
+                broadcast(p[0], p[1], cov, remaining)
+                if (idx % 100 == 0) {
+                    updateNotification("Turbo: $idx/$totalHex esagoni ($cov%)")
+                }
+                idx++
+                if (idx >= totalHex) idx = 0  // giro completato, ricomincia (Bump rigratta null-op)
+                sleep(tickMs)
+            }
+        }.also { it.start() }
+        updateNotification("Turbo avviato: $totalHex esagoni, ${1000/tickMs} push/sec")
+    }
+
+    // ray casting even-odd point-in-polygon (buchi supportati via anelli multipli)
+    private fun pointInRings(lat: Double, lng: Double, rings: List<List<DoubleArray>>): Boolean {
+        var inside = false
+        for (ring in rings) {
+            val n = ring.size
+            if (n < 3) continue
+            var j = n - 1
+            for (i in 0 until n) {
+                val yi = ring[i][0]; val xi = ring[i][1]
+                val yj = ring[j][0]; val xj = ring[j][1]
+                if (((yi > lat) != (yj > lat)) &&
+                    (lng < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi)) {
+                    inside = !inside
+                }
+                j = i
+            }
+        }
+        return inside
+    }
+
+    // ---------------- WALK: cammino graduale casa -> target per Bump confidence ----------------
+
+    // interpola linea retta da (fromLat, fromLng) a (toLat, toLng) a velocita realistica.
+    // Bump vede utente che si sposta continuamente senza teletrasporti -> confidence sale.
+    private fun startWalk(fromLat: Double, fromLng: Double, toLat: Double, toLng: Double, speedKmh: Double) {
+        val speedMs = (speedKmh / 3.6).coerceAtLeast(1.0)
+        val stepM = speedMs * (UPDATE_MS / 1000.0)
+        val cosLat = cos(Math.toRadians((fromLat + toLat) / 2.0))
+        val totalM = distM(doubleArrayOf(fromLat, fromLng), doubleArrayOf(toLat, toLng), cosLat)
+        val bearing = bearingOf(doubleArrayOf(fromLat, fromLng), doubleArrayOf(toLat, toLng), cosLat)
+
+        running = true
+        worker = Thread {
+            var traveled = 0.0
+            var lat = fromLat; var lng = fromLng
+            while (running && traveled < totalM) {
+                val f = (traveled / totalM).coerceIn(0.0, 1.0)
+                lat = fromLat + (toLat - fromLat) * f
+                lng = fromLng + (toLng - fromLng) * f
+                push(lat, lng, speedMs.toFloat(), bearing)
+                val cov = (traveled * 100 / totalM).toInt().coerceIn(0, 100)
+                val remaining = ((totalM - traveled) / speedMs).toLong()
+                broadcast(lat, lng, cov, remaining)
+                if ((traveled / stepM).toInt() % 20 == 0) {
+                    updateNotification("Walk: ${(traveled/1000).toInt()}/${(totalM/1000).toInt()} km ($cov%)")
+                }
+                traveled += stepM
+                sleep(UPDATE_MS)
+            }
+            // arrivato: rimane fermo sulla destinazione finche' l'utente non stoppa
+            updateNotification("Walk completato. Fermo a destinazione — pronto per Turbo.")
+            while (running) {
+                push(toLat, toLng, 0f, bearing)
+                broadcast(toLat, toLng, 100, 0)
+                sleep(UPDATE_MS * 5)
+            }
+        }.also { it.start() }
+        updateNotification("Walk avviato: ${(totalM/1000).toInt()} km a ${speedKmh.toInt()} km/h")
+    }
+
     // corsie verticali (nord-sud) tagliate sul confine reale con regola even-odd
     private fun buildBoundaryVerts(
         rings: List<List<DoubleArray>>,
@@ -271,6 +427,20 @@ class MockLocationService : Service() {
         }
         ys.sort()
         return ys.toDoubleArray()
+    }
+
+    // costruisce un anello circolare finto se non hai un confine reale (turbo su cerchio manuale)
+    private fun buildCircleRing(cLat: Double, cLng: Double, radiusM: Int): List<List<DoubleArray>> {
+        val cosLat = cos(Math.toRadians(cLat))
+        val dLat = radiusM / METERS_PER_DEG
+        val dLng = radiusM / (METERS_PER_DEG * cosLat)
+        val pts = ArrayList<DoubleArray>()
+        val steps = 64
+        for (i in 0 until steps) {
+            val a = 2.0 * Math.PI * i / steps
+            pts.add(doubleArrayOf(cLat + dLat * kotlin.math.sin(a), cLng + dLng * kotlin.math.cos(a)))
+        }
+        return listOf(pts)
     }
 
     // decodifica "lat,lng lat,lng ; lat,lng ..." -> anelli
@@ -554,16 +724,41 @@ class MockLocationService : Service() {
         val l = Location(provider)
         l.latitude = lat
         l.longitude = lng
-        l.altitude = 30.0
-        l.accuracy = 1.0f
+        // valori realistici jitterati: un GPS vero non dice mai accuracy=1.0 fissa, urla "MOCK"
+        l.altitude = 25.0 + Math.random() * 40.0
+        l.accuracy = (3.0f + Math.random().toFloat() * 5.0f)
         l.time = System.currentTimeMillis()
-        l.speed = speed
+        l.speed = if (speed > 0f) speed + (Math.random().toFloat() - 0.5f) * 0.4f else 0f
         l.bearing = if (bearing < 0) bearing + 360f else bearing % 360f
         l.elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            l.bearingAccuracyDegrees = 0.1f
-            l.speedAccuracyMetersPerSecond = 0.1f
-            l.verticalAccuracyMeters = 0.1f
+            l.bearingAccuracyDegrees = 1.0f + Math.random().toFloat() * 2.0f
+            l.speedAccuracyMetersPerSecond = 0.3f + Math.random().toFloat() * 0.7f
+            l.verticalAccuracyMeters = 1.5f + Math.random().toFloat() * 3.0f
+        }
+        // conteggio satelliti finto (alcune app lo controllano tramite extras)
+        try {
+            val extras = l.extras ?: android.os.Bundle()
+            extras.putInt("satellites", 8 + (Math.random() * 4).toInt())
+            extras.putBoolean("mockLocation", false)
+            l.extras = extras
+        } catch (e: Throwable) {
+        }
+        // anti-mock reflection: prova a resettare il flag isFromMockProvider
+        // Android 12+: Location.setMock(boolean) esiste ma è @hide/deprecated
+        try {
+            val setMock = Location::class.java.getMethod("setMock", Boolean::class.javaPrimitiveType)
+            setMock.invoke(l, false)
+        } catch (e: Throwable) {
+        }
+        // fallback: manipola direttamente il bit mask interno (varia per versione Android)
+        try {
+            val f = Location::class.java.getDeclaredField("mFieldsMask")
+            f.isAccessible = true
+            val mask = f.getInt(l)
+            // HAS_MOCK_PROVIDER_MASK = 0x40 (const interna framework)
+            f.setInt(l, mask and 0x40.inv())
+        } catch (e: Throwable) {
         }
         return l
     }

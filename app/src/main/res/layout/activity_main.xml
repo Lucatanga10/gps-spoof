@@ -87,14 +87,14 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Punto fisso" />
+                android:text="Fisso" />
 
             <Button
                 android:id="@+id/roamButton"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Avvia (vaga)"
+                android:text="Serpentina"
                 android:backgroundTint="#1B5E20" />
 
             <Button
@@ -104,6 +104,29 @@
                 android:layout_weight="1"
                 android:text="STOP"
                 android:backgroundTint="#B71C1C" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="4dp">
+
+            <Button
+                android:id="@+id/walkButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="WALK 🚶"
+                android:backgroundTint="#0277BD" />
+
+            <Button
+                android:id="@+id/turboButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="TURBO ⚡"
+                android:backgroundTint="#E65100" />
         </LinearLayout>
 
         <TextView
