@@ -40,6 +40,7 @@ class MockLocationService : Service() {
         const val EXTRA_SIG = "sig"
         const val EXTRA_HEX_STEP = "hex_step"
         const val EXTRA_PUSH_MS = "push_ms"
+        const val EXTRA_PUSHES_PER_HEX = "pushes_per_hex"
         const val EXTRA_WALK_FROM_LAT = "walk_from_lat"
         const val EXTRA_WALK_FROM_LNG = "walk_from_lng"
         const val MODE_FIXED = "fixed"
@@ -144,9 +145,10 @@ class MockLocationService : Service() {
                 val boundary = intent.getStringExtra(EXTRA_BOUNDARY)
                 val hexStep = intent.getDoubleExtra(EXTRA_HEX_STEP, DEFAULT_HEX_STEP_M)
                 val pushMs = intent.getLongExtra(EXTRA_PUSH_MS, DEFAULT_TURBO_MS)
+                val pushesPerHex = intent.getIntExtra(EXTRA_PUSHES_PER_HEX, 3)
                 val rings = if (!boundary.isNullOrEmpty()) parseRings(boundary)
                             else buildCircleRing(lat, lng, intent.getIntExtra(EXTRA_RADIUS, 500))
-                startTurbo(rings, hexStep, pushMs, sig)
+                startTurbo(rings, hexStep, pushMs, pushesPerHex, sig)
             }
             MODE_WALK -> {
                 val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 120.0)
@@ -246,9 +248,10 @@ class MockLocationService : Service() {
 
     // enumerare griglia esagonale dentro il poligono, iterare in serpentina, push center di ogni cella.
     // niente cammino, niente interpolazione: ogni tick = 1 esagono nuovo garantito.
-    private fun startTurbo(rings: List<List<DoubleArray>>, hexStepM: Double, pushMs: Long, sig: String) {
+    private fun startTurbo(rings: List<List<DoubleArray>>, hexStepM: Double, pushMs: Long, pushesPerHex: Int, sig: String) {
         val stepM = if (hexStepM > 20.0) hexStepM else DEFAULT_HEX_STEP_M
         val tickMs = if (pushMs in 30..5000) pushMs else DEFAULT_TURBO_MS
+        val repeats = pushesPerHex.coerceIn(1, 20)
 
         var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
         for (ring in rings) for (p in ring) {
@@ -295,20 +298,29 @@ class MockLocationService : Service() {
                     val prev = points[idx - 1]
                     lastBearing = bearingOf(prev, p, cosLat)
                 }
-                push(p[0], p[1], 30f, lastBearing)  // speed 30 m/s finta (auto in citta)
-                saveProgress(sig, idx.toDouble(), totalHex.toDouble(), p[0], p[1])
-                val cov = (idx * 100 / totalHex).coerceIn(0, 100)
-                val remaining = ((totalHex - idx).toLong() * tickMs / 1000L)
-                broadcast(p[0], p[1], cov, remaining)
-                if (idx % 100 == 0) {
-                    updateNotification("Turbo: $idx/$totalHex esagoni ($cov%)")
+                // ripeti push sullo stesso hex N volte: aumenta chance che il server ne accetti almeno 1
+                for (r in 0 until repeats) {
+                    if (!running) break
+                    // micro-jitter sulle coord per non essere ESATTAMENTE fisso (piu credibile)
+                    val jitLat = p[0] + (Math.random() - 0.5) * 0.00003
+                    val jitLng = p[1] + (Math.random() - 0.5) * 0.00003
+                    push(jitLat, jitLng, 8f, lastBearing)
+                    saveProgress(sig, idx.toDouble(), totalHex.toDouble(), jitLat, jitLng)
+                    if (r == 0) {
+                        val cov = (idx * 100 / totalHex).coerceIn(0, 100)
+                        val remaining = ((totalHex - idx).toLong() * repeats * tickMs / 1000L)
+                        broadcast(jitLat, jitLng, cov, remaining)
+                        if (idx % 50 == 0) {
+                            updateNotification("Turbo: $idx/$totalHex hex ($cov%, ${repeats}x/hex)")
+                        }
+                    }
+                    sleep(tickMs)
                 }
                 idx++
-                if (idx >= totalHex) idx = 0  // giro completato, ricomincia (Bump rigratta null-op)
-                sleep(tickMs)
+                if (idx >= totalHex) idx = 0  // giro completato, ricomincia
             }
         }.also { it.start() }
-        updateNotification("Turbo avviato: $totalHex esagoni, ${1000/tickMs} push/sec")
+        updateNotification("Turbo avviato: $totalHex hex, ${1000/tickMs}push/sec x${repeats}")
     }
 
     // ray casting even-odd point-in-polygon (buchi supportati via anelli multipli)

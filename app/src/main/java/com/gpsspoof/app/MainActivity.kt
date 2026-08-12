@@ -731,15 +731,19 @@ class MainActivity : Activity() {
         val intervalSeek = SeekBar(this).apply { max = 2800; progress = 800 } // 200..3000ms, default 1000
         val stepLabel = TextView(this)
         val stepSeek = SeekBar(this).apply { max = 400; progress = 30 } // 100..500m, default 130
+        val repeatsLabel = TextView(this)
+        val repeatsSeek = SeekBar(this).apply { max = 9; progress = 2 } // 1..10 pushes per hex, default 3
         val etaText = TextView(this).apply {
             setPadding(0, 24, 0, 0)
             setTypeface(null, android.graphics.Typeface.BOLD)
         }
         val info = TextView(this).apply {
             text = "Bump ha un rate limit sui fix ricevuti.\n" +
-                "• Se NON conta gli esagoni → AUMENTA \"Push ogni\" (piu lento = piu accettato)\n" +
-                "• Consigliato per Bump: 800-1500 ms\n" +
-                "• Passo tipico Bump: 130-200 m (H3 res 9)"
+                "• Se NON conta gli esagoni → AUMENTA \"Push ogni\" o \"Ripetiz\"\n" +
+                "• Ripetizioni per hex: quante volte spingere sullo stesso esagono\n" +
+                "  (piu ripetizioni = piu sicuro che almeno una passi il rate limit)\n" +
+                "• Config raccomandata: 500ms x 3 rip = 95%+ capture\n" +
+                "• Passo tipico Bump: 130 m (H3 res 9)"
             setPadding(0, 24, 0, 0)
             textSize = 12f
         }
@@ -747,9 +751,11 @@ class MainActivity : Activity() {
         fun updateLabels() {
             val ms = 200 + intervalSeek.progress
             val step = 100 + stepSeek.progress
-            val hexPerSec = 1000.0 / ms
+            val reps = 1 + repeatsSeek.progress
+            val hexPerSec = 1000.0 / (ms * reps)
             intervalLabel.text = "Push ogni: $ms ms"
             stepLabel.text = "Passo esagoni: $step m"
+            repeatsLabel.text = "Ripetizioni per hex: $reps"
             etaText.text = "≈ ${"%.2f".format(hexPerSec)} hex/sec  |  ~${(hexPerSec * 3600).toInt()} hex/ora"
         }
         val listener = object : SeekBar.OnSeekBarChangeListener {
@@ -759,12 +765,15 @@ class MainActivity : Activity() {
         }
         intervalSeek.setOnSeekBarChangeListener(listener)
         stepSeek.setOnSeekBarChangeListener(listener)
+        repeatsSeek.setOnSeekBarChangeListener(listener)
         updateLabels()
 
         container.addView(intervalLabel)
         container.addView(intervalSeek)
         container.addView(stepLabel)
         container.addView(stepSeek)
+        container.addView(repeatsLabel)
+        container.addView(repeatsSeek)
         container.addView(etaText)
         container.addView(info)
 
@@ -774,13 +783,14 @@ class MainActivity : Activity() {
             .setPositiveButton("AVVIA") { _, _ ->
                 val pushMs = (200 + intervalSeek.progress).toLong()
                 val hexStep = (100 + stepSeek.progress).toDouble()
-                launchTurboService(cp, pushMs, hexStep)
+                val reps = 1 + repeatsSeek.progress
+                launchTurboService(cp, pushMs, hexStep, reps)
             }
             .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
             .show()
     }
 
-    private fun launchTurboService(cp: GeoPoint, pushMs: Long, hexStep: Double) {
+    private fun launchTurboService(cp: GeoPoint, pushMs: Long, hexStep: Double, reps: Int) {
         clearLiveOverlays()
         drawPlanned(true)
         val b = boundaryRings
@@ -792,6 +802,7 @@ class MainActivity : Activity() {
             putExtra(MockLocationService.EXTRA_SIG, sig)
             putExtra(MockLocationService.EXTRA_HEX_STEP, hexStep)
             putExtra(MockLocationService.EXTRA_PUSH_MS, pushMs)
+            putExtra(MockLocationService.EXTRA_PUSHES_PER_HEX, reps)
             if (b != null) {
                 putExtra(MockLocationService.EXTRA_BOUNDARY, encodeRings(b))
             } else {
@@ -799,7 +810,7 @@ class MainActivity : Activity() {
             }
         }
         startForegroundService(i)
-        setStatus("TURBO — ${"%.2f".format(1000.0 / pushMs)} hex/sec, passo ${hexStep.toInt()}m")
+        setStatus("TURBO — ${1000L / pushMs}push/s x$reps rip, passo ${hexStep.toInt()}m")
     }
 
     // ---------------- WALK: cammino graduale da casa al target ----------------
