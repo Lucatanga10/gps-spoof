@@ -127,8 +127,8 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
-        // velocita fino a 5000 km/h per la modalita walk / roam turbo simulato
-        speedSeek.max = 5000
+        // velocita fino a 10000 km/h — fix tick dinamico tiene passo ~100m per ogni velocita
+        speedSeek.max = 10000
         speedSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                 speedKmh = p.coerceAtLeast(1)
@@ -154,6 +154,7 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.roamButton).setOnClickListener { startRoam() }
         findViewById<Button>(R.id.turboButton)?.setOnClickListener { startTurbo() }
         findViewById<Button>(R.id.walkButton)?.setOnClickListener { startWalk() }
+        findViewById<Button>(R.id.tourButton)?.setOnClickListener { startTour() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             askStopConfirm(1)
         }
@@ -851,6 +852,98 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
             .show()
+    }
+
+    // ---------------- TOUR: tutti i paesi del mondo in automatico ----------------
+
+    private fun startTour() {
+        if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+
+        val countries = Countries.list
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+
+        val speedLabel = TextView(this)
+        val speedSeekTour = SeekBar(this).apply { max = 10000; progress = 5000 }
+        val stayLabel = TextView(this)
+        val staySeek = SeekBar(this).apply { max = 300; progress = 60 }
+        val startLabel = TextView(this)
+        val startSeek = SeekBar(this).apply { max = countries.size - 1; progress = 0 }
+        val etaText = TextView(this).apply {
+            setPadding(0, 24, 0, 0)
+            setTypeface(null, android.graphics.Typeface.BOLD)
+        }
+        val info = TextView(this).apply {
+            text = "Cammina automaticamente da paese a paese.\n" +
+                "${countries.size} paesi nel mondo.\n" +
+                "Velocita: quanto veloce viaggi tra i paesi.\n" +
+                "Sosta: secondi fermi in ogni paese per grattare.\n" +
+                "Partenza: da quale paese iniziare (se vuoi riprendere)."
+            setPadding(0, 24, 0, 0)
+            textSize = 12f
+        }
+
+        fun updateLabels() {
+            val kmh = speedSeekTour.progress.coerceAtLeast(100)
+            val stay = staySeek.progress.coerceAtLeast(10)
+            val start = startSeek.progress
+            speedLabel.text = "Velocita: $kmh km/h"
+            stayLabel.text = "Sosta per paese: ${stay}s"
+            startLabel.text = "Partenza: #${start + 1} ${countries[start].name}"
+            val remaining = countries.size - start
+            val avgDistKm = 2000.0
+            val travelH = remaining * avgDistKm / kmh
+            val stayH = remaining * stay / 3600.0
+            val totalH = travelH + stayH
+            etaText.text = "~$remaining paesi, tempo totale stimato: ${"%.0f".format(totalH)}h (${"%.1f".format(totalH / 24)}g)"
+        }
+
+        val listener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) { updateLabels() }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        }
+        speedSeekTour.setOnSeekBarChangeListener(listener)
+        staySeek.setOnSeekBarChangeListener(listener)
+        startSeek.setOnSeekBarChangeListener(listener)
+        updateLabels()
+
+        container.addView(speedLabel)
+        container.addView(speedSeekTour)
+        container.addView(stayLabel)
+        container.addView(staySeek)
+        container.addView(startLabel)
+        container.addView(startSeek)
+        container.addView(etaText)
+        container.addView(info)
+
+        AlertDialog.Builder(this)
+            .setTitle("TOUR MONDIALE — ${countries.size} paesi")
+            .setView(container)
+            .setPositiveButton("AVVIA TOUR") { _, _ ->
+                val kmh = speedSeekTour.progress.coerceAtLeast(100).toDouble()
+                val stay = staySeek.progress.coerceAtLeast(10)
+                val start = startSeek.progress
+                launchTourService(kmh, stay, start)
+            }
+            .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
+            .show()
+    }
+
+    private fun launchTourService(speedKmh: Double, staySeconds: Int, startIndex: Int) {
+        clearLiveOverlays()
+        val countries = Countries.list
+        val c = countries[startIndex]
+        val i = Intent(this, MockLocationService::class.java).apply {
+            putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_TOUR)
+            putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh)
+            putExtra(MockLocationService.EXTRA_STAY_SECONDS, staySeconds)
+            putExtra(MockLocationService.EXTRA_TOUR_START_INDEX, startIndex)
+        }
+        startForegroundService(i)
+        setStatus("TOUR avviato da ${c.name} — ${speedKmh.toInt()} km/h, sosta ${staySeconds}s")
     }
 
     // firma della zona: distingue un giro salvato per confine citta o per cerchio

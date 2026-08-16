@@ -43,10 +43,14 @@ class MockLocationService : Service() {
         const val EXTRA_PUSHES_PER_HEX = "pushes_per_hex"
         const val EXTRA_WALK_FROM_LAT = "walk_from_lat"
         const val EXTRA_WALK_FROM_LNG = "walk_from_lng"
+        const val EXTRA_STAY_SECONDS = "stay_seconds"
+        const val EXTRA_TOUR_START_INDEX = "tour_start_index"
+        const val EXTRA_COUNTRY_NAME = "country_name"
         const val MODE_FIXED = "fixed"
         const val MODE_ROAM = "roam"
         const val MODE_TURBO = "turbo"
         const val MODE_WALK = "walk"
+        const val MODE_TOUR = "tour"
         const val ACTION_UPDATE = "com.gpsspoof.app.UPDATE"
 
         // progresso salvato: sopravvive a stop/chiusura app -> permette la ripresa
@@ -155,6 +159,12 @@ class MockLocationService : Service() {
                 val fromLat = intent.getDoubleExtra(EXTRA_WALK_FROM_LAT, lat)
                 val fromLng = intent.getDoubleExtra(EXTRA_WALK_FROM_LNG, lng)
                 startWalk(fromLat, fromLng, lat, lng, speedKmh)
+            }
+            MODE_TOUR -> {
+                val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 5000.0)
+                val staySeconds = intent.getIntExtra(EXTRA_STAY_SECONDS, 60)
+                val startIndex = intent.getIntExtra(EXTRA_TOUR_START_INDEX, 0)
+                startTour(speedKmh, staySeconds, startIndex)
             }
             else -> stopSelf()
         }
@@ -349,7 +359,10 @@ class MockLocationService : Service() {
     // Bump vede utente che si sposta continuamente senza teletrasporti -> confidence sale.
     private fun startWalk(fromLat: Double, fromLng: Double, toLat: Double, toLng: Double, speedKmh: Double) {
         val speedMs = (speedKmh / 3.6).coerceAtLeast(1.0)
-        val stepM = speedMs * (UPDATE_MS / 1000.0)
+        val targetStepM = 100.0
+        val dynamicMs = ((targetStepM / speedMs) * 1000).toLong().coerceIn(50, 1000)
+        val stepM = speedMs * (dynamicMs / 1000.0)
+        val notifyEvery = (1000 / dynamicMs).coerceAtLeast(1)
         val cosLat = cos(Math.toRadians((fromLat + toLat) / 2.0))
         val totalM = distM(doubleArrayOf(fromLat, fromLng), doubleArrayOf(toLat, toLng), cosLat)
         val bearing = bearingOf(doubleArrayOf(fromLat, fromLng), doubleArrayOf(toLat, toLng), cosLat)
@@ -358,22 +371,23 @@ class MockLocationService : Service() {
         worker = Thread {
             var traveled = 0.0
             var lat = fromLat; var lng = fromLng
+            var tick = 0L
             while (running && traveled < totalM) {
                 val f = (traveled / totalM).coerceIn(0.0, 1.0)
                 lat = fromLat + (toLat - fromLat) * f
                 lng = fromLng + (toLng - fromLng) * f
                 push(lat, lng, speedMs.toFloat(), bearing)
-                val cov = (traveled * 100 / totalM).toInt().coerceIn(0, 100)
-                val remaining = ((totalM - traveled) / speedMs).toLong()
-                broadcast(lat, lng, cov, remaining)
-                if ((traveled / stepM).toInt() % 20 == 0) {
+                if (tick % notifyEvery == 0L) {
+                    val cov = (traveled * 100 / totalM).toInt().coerceIn(0, 100)
+                    val remaining = ((totalM - traveled) / speedMs).toLong()
+                    broadcast(lat, lng, cov, remaining)
                     updateNotification("Walk: ${(traveled/1000).toInt()}/${(totalM/1000).toInt()} km ($cov%)")
                 }
                 traveled += stepM
-                sleep(UPDATE_MS)
+                tick++
+                sleep(dynamicMs)
             }
-            // arrivato: rimane fermo sulla destinazione finche' l'utente non stoppa
-            updateNotification("Walk completato. Fermo a destinazione — pronto per Turbo.")
+            updateNotification("Walk completato. Fermo a destinazione.")
             while (running) {
                 push(toLat, toLng, 0f, bearing)
                 broadcast(toLat, toLng, 100, 0)
@@ -381,6 +395,80 @@ class MockLocationService : Service() {
             }
         }.also { it.start() }
         updateNotification("Walk avviato: ${(totalM/1000).toInt()} km a ${speedKmh.toInt()} km/h")
+    }
+
+    // ---------------- TOUR: cammino automatico tra tutti i paesi del mondo ----------------
+
+    private fun startTour(speedKmh: Double, staySeconds: Int, startIndex: Int) {
+        val countries = Countries.list
+        if (startIndex >= countries.size) { stopSelf(); return }
+        val speedMs = (speedKmh / 3.6).coerceAtLeast(1.0)
+        val targetStepM = 100.0
+        val dynamicMs = ((targetStepM / speedMs) * 1000).toLong().coerceIn(50, 1000)
+        val stepM = speedMs * (dynamicMs / 1000.0)
+        val notifyEvery = (1000 / dynamicMs).coerceAtLeast(1)
+        val total = countries.size
+
+        running = true
+        worker = Thread {
+            var curLat = countries[startIndex].lat
+            var curLng = countries[startIndex].lng
+
+            for (ci in startIndex until total) {
+                if (!running) break
+                val c = countries[ci]
+                val cosLat = cos(Math.toRadians((curLat + c.lat) / 2.0))
+                val totalM = distM(doubleArrayOf(curLat, curLng), doubleArrayOf(c.lat, c.lng), cosLat)
+                val bearing = bearingOf(doubleArrayOf(curLat, curLng), doubleArrayOf(c.lat, c.lng), cosLat)
+
+                // cammina verso il paese
+                var traveled = 0.0
+                var tick = 0L
+                while (running && traveled < totalM) {
+                    val f = (traveled / totalM).coerceIn(0.0, 1.0)
+                    val lat = curLat + (c.lat - curLat) * f
+                    val lng = curLng + (c.lng - curLng) * f
+                    push(lat, lng, speedMs.toFloat(), bearing)
+                    if (tick % notifyEvery == 0L) {
+                        val walkPct = (traveled * 100 / totalM).toInt().coerceIn(0, 100)
+                        val overallPct = (ci * 100 / total)
+                        broadcast(lat, lng, overallPct)
+                        updateNotification("Tour ${ci + 1}/$total: ${c.name} — in viaggio $walkPct%")
+                    }
+                    traveled += stepM
+                    tick++
+                    sleep(dynamicMs)
+                }
+
+                if (!running) break
+
+                // sosta nel paese: push posizione fissa per staySeconds
+                updateNotification("Tour ${ci + 1}/$total: ${c.name} — gratto!")
+                broadcast(c.lat, c.lng, (ci * 100 / total))
+                val stayEnd = System.currentTimeMillis() + staySeconds * 1000L
+                while (running && System.currentTimeMillis() < stayEnd) {
+                    push(c.lat, c.lng, 0f, 0f)
+                    val remaining = (stayEnd - System.currentTimeMillis()) / 1000
+                    broadcast(c.lat, c.lng, (ci * 100 / total), remaining)
+                    sleep(1000)
+                }
+
+                curLat = c.lat
+                curLng = c.lng
+                saveProgress("tour", ci.toDouble(), total.toDouble(), curLat, curLng)
+            }
+
+            if (running) {
+                updateNotification("Tour completato! Tutti i $total paesi visitati.")
+                while (running) {
+                    val last = countries.last()
+                    push(last.lat, last.lng, 0f, 0f)
+                    broadcast(last.lat, last.lng, 100, 0)
+                    sleep(5000)
+                }
+            }
+        }.also { it.start() }
+        updateNotification("Tour avviato: $total paesi, ${speedKmh.toInt()} km/h, sosta ${staySeconds}s")
     }
 
     // corsie verticali (nord-sud) tagliate sul confine reale con regola even-odd
@@ -476,7 +564,10 @@ class MockLocationService : Service() {
     // motore di cammino condiviso: percorre i vertici a passo costante, ciclando.
     // startTraveled = metri gia percorsi in un giro precedente (ripresa da posizione salvata).
     private fun walk(verts: List<DoubleArray>, speedMs: Double, cosLat: Double, startTraveled: Double, sig: String) {
-        val stepM = speedMs * (UPDATE_MS / 1000.0)
+        val targetStepM = 100.0
+        val dynamicMs = ((targetStepM / speedMs) * 1000).toLong().coerceIn(50, 1000)
+        val stepM = speedMs * (dynamicMs / 1000.0)
+        val notifyEvery = (1000 / dynamicMs).coerceAtLeast(1)
         var totalLen = 0.0
         for (i in 0 until verts.size - 1) totalLen += distM(verts[i], verts[i + 1], cosLat)
         if (totalLen <= 0) totalLen = 1.0
@@ -488,7 +579,6 @@ class MockLocationService : Service() {
             var cur = doubleArrayOf(verts[0][0], verts[0][1])
             var traveled = 0.0
 
-            // ripresa: avanza fino al punto salvato prima di iniziare a spingere posizioni
             val startAt = if (startTraveled > 0) startTraveled % total else 0.0
             if (startAt > 0) {
                 var acc = 0.0
@@ -505,6 +595,7 @@ class MockLocationService : Service() {
                 }
             }
             var lastBearing = 0f
+            var tick = 0L
 
             while (running) {
                 var stepRemaining = stepM
@@ -519,7 +610,6 @@ class MockLocationService : Service() {
                         traveled += segLen
                         seg++
                         if (seg >= verts.size - 1) {
-                            // percorso completato: ricomincia
                             seg = 0
                             cur = doubleArrayOf(verts[0][0], verts[0][1])
                             traveled = 0.0
@@ -536,14 +626,17 @@ class MockLocationService : Service() {
                     }
                 }
 
-                val cov = (traveled * 100 / total).toInt().coerceIn(0, 100)
-                val remainingSecs = ((total - traveled) / speedMs).toLong().coerceAtLeast(0)
                 push(cur[0], cur[1], speedMs.toFloat(), lastBearing)
                 saveProgress(sig, traveled, total, cur[0], cur[1])
-                broadcast(cur[0], cur[1], cov, remainingSecs)
-                if (traveled < stepM) updateNotification("Serpentina: nuovo giro")
-                else updateNotification("Serpentina: completato $cov%")
-                sleep(UPDATE_MS)
+                if (tick % notifyEvery == 0L) {
+                    val cov = (traveled * 100 / total).toInt().coerceIn(0, 100)
+                    val remainingSecs = ((total - traveled) / speedMs).toLong().coerceAtLeast(0)
+                    broadcast(cur[0], cur[1], cov, remainingSecs)
+                    if (traveled < stepM) updateNotification("Serpentina: nuovo giro")
+                    else updateNotification("Serpentina: completato $cov%")
+                }
+                tick++
+                sleep(dynamicMs)
             }
         }.also { it.start() }
     }

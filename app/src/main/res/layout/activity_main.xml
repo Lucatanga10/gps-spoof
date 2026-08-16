@@ -127,6 +127,14 @@
                 android:layout_weight="1"
                 android:text="TURBO ⚡"
                 android:backgroundTint="#E65100" />
+
+            <Button
+                android:id="@+id/tourButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="TOUR 🌍"
+                android:backgroundTint="#6A1B9A" />
         </LinearLayout>
 
         <TextView
