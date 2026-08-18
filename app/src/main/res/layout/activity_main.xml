@@ -129,6 +129,29 @@
                 android:backgroundTint="#E65100" />
         </LinearLayout>
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="4dp">
+
+            <Button
+                android:id="@+id/poiButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="POI 📍"
+                android:backgroundTint="#6A1B9A" />
+
+            <Button
+                android:id="@+id/poiLoopButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="LOOP 🔁"
+                android:backgroundTint="#AD1457" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/statusText"
             android:layout_width="match_parent"

@@ -43,10 +43,18 @@ class MockLocationService : Service() {
         const val EXTRA_PUSHES_PER_HEX = "pushes_per_hex"
         const val EXTRA_WALK_FROM_LAT = "walk_from_lat"
         const val EXTRA_WALK_FROM_LNG = "walk_from_lng"
+        // POI loop farmer: lista target "lat,lng;lat,lng;..." + dwell + loops
+        const val EXTRA_POI_TARGETS = "poi_targets"
+        const val EXTRA_POI_HOME_LAT = "poi_home_lat"
+        const val EXTRA_POI_HOME_LNG = "poi_home_lng"
+        const val EXTRA_POI_DWELL_SEC = "poi_dwell_sec"
+        const val EXTRA_POI_LOOPS = "poi_loops"
+        const val EXTRA_POI_RETURN_HOME = "poi_return_home"
         const val MODE_FIXED = "fixed"
         const val MODE_ROAM = "roam"
         const val MODE_TURBO = "turbo"
         const val MODE_WALK = "walk"
+        const val MODE_POI_LOOP = "poi_loop"
         const val ACTION_UPDATE = "com.gpsspoof.app.UPDATE"
 
         // progresso salvato: sopravvive a stop/chiusura app -> permette la ripresa
@@ -155,6 +163,21 @@ class MockLocationService : Service() {
                 val fromLat = intent.getDoubleExtra(EXTRA_WALK_FROM_LAT, lat)
                 val fromLng = intent.getDoubleExtra(EXTRA_WALK_FROM_LNG, lng)
                 startWalk(fromLat, fromLng, lat, lng, speedKmh)
+            }
+            MODE_POI_LOOP -> {
+                val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 500.0)
+                val homeLat = intent.getDoubleExtra(EXTRA_POI_HOME_LAT, lat)
+                val homeLng = intent.getDoubleExtra(EXTRA_POI_HOME_LNG, lng)
+                val dwellSec = intent.getIntExtra(EXTRA_POI_DWELL_SEC, 90)
+                val loops = intent.getIntExtra(EXTRA_POI_LOOPS, 0)  // 0 = infinito
+                val returnHome = intent.getBooleanExtra(EXTRA_POI_RETURN_HOME, true)
+                val targets = parsePoiList(intent.getStringExtra(EXTRA_POI_TARGETS) ?: "")
+                if (targets.isEmpty()) {
+                    updateNotification("Nessun POI selezionato")
+                    stopSelf()
+                } else {
+                    startPoiLoop(homeLat, homeLng, targets, dwellSec, speedKmh, loops, returnHome)
+                }
             }
             else -> stopSelf()
         }
@@ -341,6 +364,122 @@ class MockLocationService : Service() {
             }
         }
         return inside
+    }
+
+    // ---------------- POI LOOP: farming visite ristoranti/negozi ----------------
+
+    // ciclo:  home -> POI1 -> dwell -> home -> POI2 -> dwell -> home ...
+    //         (o home -> POI1 -> dwell -> POI2 -> dwell ... senza tornare, se returnHome=false)
+    //   speedKmh = velocita di walk simulata tra due punti
+    //   dwellSec = quanto restare fermi sul POI (=  quanto amo vuole per contare la visita, ~90s tipico)
+    //   loops = 0 → infinito, altrimenti quante volte fare il giro completo di tutti i POI
+    private fun startPoiLoop(
+        homeLat: Double, homeLng: Double,
+        targets: List<DoubleArray>,
+        dwellSec: Int, speedKmh: Double,
+        loops: Int, returnHome: Boolean
+    ) {
+        val speedMs = (speedKmh / 3.6).coerceAtLeast(1.0)
+        val stepM = speedMs * (UPDATE_MS / 1000.0)
+
+        running = true
+        worker = Thread {
+            var loopIdx = 0
+            var totalVisits = 0
+            var curLat = homeLat
+            var curLng = homeLng
+
+            while (running && (loops == 0 || loopIdx < loops)) {
+                loopIdx++
+                for ((tIdx, target) in targets.withIndex()) {
+                    if (!running) break
+                    val tLat = target[0]; val tLng = target[1]
+
+                    // walk verso POI
+                    val cosLat = cos(Math.toRadians((curLat + tLat) / 2.0))
+                    val totalM = distM(doubleArrayOf(curLat, curLng), doubleArrayOf(tLat, tLng), cosLat)
+                    val bearing = bearingOf(doubleArrayOf(curLat, curLng), doubleArrayOf(tLat, tLng), cosLat)
+                    val fromLat = curLat; val fromLng = curLng
+                    var traveled = 0.0
+                    updateNotification("POI loop $loopIdx: → ${tIdx + 1}/${targets.size} (${(totalM/1000).toInt()} km)")
+                    while (running && traveled < totalM) {
+                        val f = (traveled / totalM).coerceIn(0.0, 1.0)
+                        curLat = fromLat + (tLat - fromLat) * f
+                        curLng = fromLng + (tLng - fromLng) * f
+                        push(curLat, curLng, speedMs.toFloat(), bearing)
+                        val cov = (traveled * 100 / totalM).toInt().coerceIn(0, 100)
+                        val remaining = ((totalM - traveled) / speedMs).toLong()
+                        broadcast(curLat, curLng, cov, remaining)
+                        traveled += stepM
+                        sleep(UPDATE_MS)
+                    }
+                    // arrivato: fissa esatto sul POI
+                    if (!running) break
+                    curLat = tLat; curLng = tLng
+                    push(curLat, curLng, 0f, bearing)
+
+                    // dwell: resta fermo (con micro-jitter GPS realistico) dwellSec secondi
+                    updateNotification("POI $loopIdx/${targets.size}: dwell ${dwellSec}s su POI ${tIdx + 1}")
+                    val dwellStart = System.currentTimeMillis()
+                    while (running && (System.currentTimeMillis() - dwellStart) < dwellSec * 1000L) {
+                        val jLat = tLat + (Math.random() - 0.5) * 0.00002  // ~1-2m
+                        val jLng = tLng + (Math.random() - 0.5) * 0.00002
+                        push(jLat, jLng, 0f, bearing)
+                        val leftSec = (dwellSec * 1000L - (System.currentTimeMillis() - dwellStart)) / 1000L
+                        broadcast(tLat, tLng, 100, leftSec)
+                        sleep(UPDATE_MS)
+                    }
+                    totalVisits++
+                    updateNotification("POI loop: $totalVisits visite completate (giro $loopIdx)")
+
+                    if (!running) break
+
+                    // ritorno a casa (opzionale, tra un POI e il prossimo)
+                    if (returnHome && (tIdx < targets.size - 1 || (loops == 0 || loopIdx < loops))) {
+                        val cosLat2 = cos(Math.toRadians((curLat + homeLat) / 2.0))
+                        val backM = distM(doubleArrayOf(curLat, curLng), doubleArrayOf(homeLat, homeLng), cosLat2)
+                        val backBrg = bearingOf(doubleArrayOf(curLat, curLng), doubleArrayOf(homeLat, homeLng), cosLat2)
+                        val fLat = curLat; val fLng = curLng
+                        var backTrav = 0.0
+                        updateNotification("POI loop $loopIdx: ← rientro a casa (${(backM/1000).toInt()} km)")
+                        while (running && backTrav < backM) {
+                            val f = (backTrav / backM).coerceIn(0.0, 1.0)
+                            curLat = fLat + (homeLat - fLat) * f
+                            curLng = fLng + (homeLng - fLng) * f
+                            push(curLat, curLng, speedMs.toFloat(), backBrg)
+                            broadcast(curLat, curLng, (backTrav * 100 / backM).toInt(), ((backM - backTrav) / speedMs).toLong())
+                            backTrav += stepM
+                            sleep(UPDATE_MS)
+                        }
+                        curLat = homeLat; curLng = homeLng
+                        push(curLat, curLng, 0f, backBrg)
+                        // pausa breve a casa (5s) per non spammare
+                        sleep(5000)
+                    }
+                }
+            }
+            updateNotification("POI loop finito: $totalVisits visite totali in $loopIdx giri")
+            // rimane fisso su ultima posizione finche non stoppi
+            while (running) {
+                push(curLat, curLng, 0f, 0f)
+                sleep(UPDATE_MS * 3)
+            }
+        }.also { it.start() }
+        updateNotification("POI loop avviato: ${targets.size} POI, dwell ${dwellSec}s, ${if (loops == 0) "∞" else loops.toString()} giri")
+    }
+
+    // decodifica "lat,lng;lat,lng;..." -> lista di [lat,lng]
+    private fun parsePoiList(s: String): List<DoubleArray> {
+        val out = ArrayList<DoubleArray>()
+        for (pStr in s.split(';')) {
+            if (pStr.isBlank()) continue
+            val c = pStr.split(',')
+            if (c.size < 2) continue
+            val la = c[0].toDoubleOrNull() ?: continue
+            val ln = c[1].toDoubleOrNull() ?: continue
+            out.add(doubleArrayOf(la, ln))
+        }
+        return out
     }
 
     // ---------------- WALK: cammino graduale casa -> target per Bump confidence ----------------

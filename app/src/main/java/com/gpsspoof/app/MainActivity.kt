@@ -71,6 +71,12 @@ class MainActivity : Activity() {
     private var boundaryRings: List<List<GeoPoint>>? = null
     private val boundaryOverlays = ArrayList<Overlay>()
 
+    // POI farmer state
+    private val poiMarkers = ArrayList<Marker>()
+    private var lastPoiFetch: List<PoiRepository.Poi> = emptyList()
+    private val poiTargets = ArrayList<PoiRepository.Poi>()  // ordine in cui verranno visitati
+    private var poiLayerOn = false
+
     private var receiverRegistered = false
     private val updateReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
@@ -154,6 +160,8 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.roamButton).setOnClickListener { startRoam() }
         findViewById<Button>(R.id.turboButton)?.setOnClickListener { startTurbo() }
         findViewById<Button>(R.id.walkButton)?.setOnClickListener { startWalk() }
+        findViewById<Button>(R.id.poiButton)?.setOnClickListener { togglePoiLayer() }
+        findViewById<Button>(R.id.poiLoopButton)?.setOnClickListener { openPoiLoopDialog() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             askStopConfirm(1)
         }
@@ -851,6 +859,213 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
             .show()
+    }
+
+    // ---------------- POI FARMER: ristoranti/negozi/bar da OpenStreetMap ----------------
+
+    private fun togglePoiLayer() {
+        if (poiLayerOn) {
+            clearPoiMarkers()
+            poiLayerOn = false
+            setStatus("POI nascosti")
+            return
+        }
+        val bb = map.boundingBox
+        if (bb == null || (bb.latNorth - bb.latSouth) > 0.3) {
+            toast("Zoomma di piu prima di caricare i POI (area troppo grande)")
+            return
+        }
+        setStatus("Carico POI da OpenStreetMap...")
+        Thread {
+            val pois = PoiRepository.fetchInBbox(bb.latSouth, bb.lonWest, bb.latNorth, bb.lonEast, cap = 500)
+            runOnUiThread {
+                if (pois.isEmpty()) { toast("Nessun POI trovato in questa area"); return@runOnUiThread }
+                lastPoiFetch = pois
+                drawPoiMarkers(pois)
+                poiLayerOn = true
+                setStatus("POI caricati: ${pois.size}. Tocca un pin per aggiungerlo alla lista visite.")
+            }
+        }.start()
+    }
+
+    private fun drawPoiMarkers(pois: List<PoiRepository.Poi>) {
+        clearPoiMarkers()
+        for (p in pois) {
+            val m = Marker(map).apply {
+                position = GeoPoint(p.lat, p.lng)
+                title = p.name
+                subDescription = "${p.category} — ${p.type}"
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                icon = null  // usa default; se vuoi diverso per tipo, sostituisci qui
+                setOnMarkerClickListener { marker, _ ->
+                    togglePoiTarget(p)
+                    // colora il marker se selezionato
+                    refreshPoiMarkerLabel(marker, p)
+                    map.invalidate()
+                    true
+                }
+            }
+            // se e' gia in lista target, evidenzia
+            refreshPoiMarkerLabel(m, p)
+            poiMarkers.add(m)
+            map.overlays.add(m)
+        }
+        // rimetti posMarker in cima
+        posMarker?.let { map.overlays.remove(it); map.overlays.add(it) }
+        map.invalidate()
+    }
+
+    private fun refreshPoiMarkerLabel(marker: Marker, poi: PoiRepository.Poi) {
+        val idx = poiTargets.indexOfFirst { it.id == poi.id }
+        marker.title = if (idx >= 0) "★ #${idx + 1} — ${poi.name}" else poi.name
+    }
+
+    private fun togglePoiTarget(poi: PoiRepository.Poi) {
+        val i = poiTargets.indexOfFirst { it.id == poi.id }
+        if (i >= 0) {
+            poiTargets.removeAt(i)
+            toast("Rimosso: ${poi.name}")
+        } else {
+            poiTargets.add(poi)
+            toast("Aggiunto #${poiTargets.size}: ${poi.name}")
+        }
+        // aggiorna tutte le etichette (i numeri d'ordine cambiano se rimuovi qualcosa in mezzo)
+        for (mk in poiMarkers) {
+            val p = lastPoiFetch.firstOrNull {
+                Math.abs(it.lat - mk.position.latitude) < 1e-7 &&
+                Math.abs(it.lng - mk.position.longitude) < 1e-7
+            } ?: continue
+            refreshPoiMarkerLabel(mk, p)
+        }
+        map.invalidate()
+    }
+
+    private fun clearPoiMarkers() {
+        for (m in poiMarkers) map.overlays.remove(m)
+        poiMarkers.clear()
+        map.invalidate()
+    }
+
+    private fun openPoiLoopDialog() {
+        if (poiTargets.isEmpty()) {
+            toast("Seleziona almeno un POI toccando i pin sulla mappa (attiva prima il layer POI)")
+            return
+        }
+        if (!hasLocationPermission()) { requestPermissions(); toast("Concedi il permesso posizione"); return }
+
+        // home = ultima posizione reale del telefono (fallback: centerPoint corrente)
+        val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        var homeLat = centerPoint?.latitude ?: 44.6469
+        var homeLng = centerPoint?.longitude ?: 10.9252
+        try {
+            val real = lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.PASSIVE_PROVIDER)
+            if (real != null) { homeLat = real.latitude; homeLng = real.longitude }
+        } catch (_: Exception) {}
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+        val listTxt = TextView(this).apply {
+            text = "Target selezionati (${poiTargets.size}):\n" +
+                poiTargets.withIndex().joinToString("\n") { (i, p) -> "  ${i + 1}. ${p.name} — ${p.category}" }
+            textSize = 12f
+        }
+        val homeTxt = TextView(this).apply {
+            text = "Casa: %.5f, %.5f".format(homeLat, homeLng)
+            setPadding(0, 16, 0, 16)
+        }
+        val dwellLabel = TextView(this)
+        val dwellSeek = SeekBar(this).apply { max = 590; progress = 80 }  // 10..600s, default 90s
+        val speedLabel = TextView(this)
+        val speedSeek2 = SeekBar(this).apply { max = 4990; progress = 490 }  // 10..5000 km/h, default 500
+        val loopsLabel = TextView(this)
+        val loopsSeek = SeekBar(this).apply { max = 100; progress = 0 }  // 0=∞, 1..100
+        val returnCb = android.widget.CheckBox(this).apply {
+            text = "Torna a casa tra un POI e il successivo (piu realistico)"
+            isChecked = true
+        }
+        val info = TextView(this).apply {
+            text = "• Dwell = quanto tempo restare sul POI (amo tipicamente vuole 60-180s per contare la visita)\n" +
+                "• Se non conta le visite → alza dwell a 180s o piu\n" +
+                "• Velocita = quanto vai veloce tra casa e POI (500 km/h ~ ok per farm veloce)\n" +
+                "• Giri = 0 significa infinito. Un giro = visita a TUTTI i POI selezionati.\n" +
+                "• Casa = usa la tua posizione reale attuale (o il pin manuale se non disponibile)"
+            setPadding(0, 16, 0, 0)
+            textSize = 11f
+        }
+
+        fun updateLabels() {
+            val dw = 10 + dwellSeek.progress
+            val sp = 10 + speedSeek2.progress
+            val lp = loopsSeek.progress
+            dwellLabel.text = "Dwell sul POI: ${dw}s"
+            speedLabel.text = "Velocita walk: $sp km/h"
+            loopsLabel.text = "Giri: ${if (lp == 0) "∞ (infinito)" else lp.toString()}"
+        }
+        val listener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) = updateLabels()
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        }
+        dwellSeek.setOnSeekBarChangeListener(listener)
+        speedSeek2.setOnSeekBarChangeListener(listener)
+        loopsSeek.setOnSeekBarChangeListener(listener)
+        updateLabels()
+
+        container.addView(listTxt)
+        container.addView(homeTxt)
+        container.addView(dwellLabel); container.addView(dwellSeek)
+        container.addView(speedLabel); container.addView(speedSeek2)
+        container.addView(loopsLabel); container.addView(loopsSeek)
+        container.addView(returnCb)
+        container.addView(info)
+
+        val scroll = android.widget.ScrollView(this).apply { addView(container) }
+
+        AlertDialog.Builder(this)
+            .setTitle("POI Loop Farmer")
+            .setView(scroll)
+            .setPositiveButton("AVVIA") { _, _ ->
+                val dwell = 10 + dwellSeek.progress
+                val speedKmh = 10 + speedSeek2.progress
+                val loops = loopsSeek.progress
+                val returnHome = returnCb.isChecked
+                launchPoiLoop(homeLat, homeLng, dwell, speedKmh, loops, returnHome)
+            }
+            .setNeutralButton("Svuota lista") { _, _ ->
+                poiTargets.clear()
+                for (mk in poiMarkers) {
+                    val p = lastPoiFetch.firstOrNull {
+                        Math.abs(it.lat - mk.position.latitude) < 1e-7 &&
+                        Math.abs(it.lng - mk.position.longitude) < 1e-7
+                    } ?: continue
+                    refreshPoiMarkerLabel(mk, p)
+                }
+                map.invalidate()
+                toast("Lista svuotata")
+            }
+            .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
+            .show()
+    }
+
+    private fun launchPoiLoop(homeLat: Double, homeLng: Double, dwellSec: Int, speedKmh: Int, loops: Int, returnHome: Boolean) {
+        clearLiveOverlays()
+        val targetsStr = poiTargets.joinToString(";") { "${it.lat},${it.lng}" }
+        val i = Intent(this, MockLocationService::class.java).apply {
+            putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_POI_LOOP)
+            putExtra(MockLocationService.EXTRA_POI_HOME_LAT, homeLat)
+            putExtra(MockLocationService.EXTRA_POI_HOME_LNG, homeLng)
+            putExtra(MockLocationService.EXTRA_POI_TARGETS, targetsStr)
+            putExtra(MockLocationService.EXTRA_POI_DWELL_SEC, dwellSec)
+            putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
+            putExtra(MockLocationService.EXTRA_POI_LOOPS, loops)
+            putExtra(MockLocationService.EXTRA_POI_RETURN_HOME, returnHome)
+        }
+        startForegroundService(i)
+        setStatus("POI loop avviato: ${poiTargets.size} POI, dwell ${dwellSec}s, ${if (loops == 0) "∞" else loops.toString()} giri")
     }
 
     // firma della zona: distingue un giro salvato per confine citta o per cerchio
