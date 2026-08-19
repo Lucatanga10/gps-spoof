@@ -55,7 +55,15 @@ class MockLocationService : Service() {
         const val MODE_TURBO = "turbo"
         const val MODE_WALK = "walk"
         const val MODE_POI_LOOP = "poi_loop"
+        const val MODE_COUNTRY_TOUR = "country_tour"
+        const val EXTRA_TOUR_CODES = "tour_codes"        // "IT;DE;FR;..."
+        const val EXTRA_TOUR_TARGETS = "tour_targets"    // "lat,lng;lat,lng;..."
+        const val EXTRA_TOUR_DWELL_SEC = "tour_dwell_sec"
+        const val EXTRA_TOUR_FROM_LAT = "tour_from_lat"
+        const val EXTRA_TOUR_FROM_LNG = "tour_from_lng"
         const val ACTION_UPDATE = "com.gpsspoof.app.UPDATE"
+        const val ACTION_COUNTRY_DONE = "com.gpsspoof.app.COUNTRY_DONE"
+        const val EXTRA_COUNTRY_CODE = "country_code"
 
         // progresso salvato: sopravvive a stop/chiusura app -> permette la ripresa
         const val PROGRESS_PREFS = "spoof_progress"
@@ -163,6 +171,22 @@ class MockLocationService : Service() {
                 val fromLat = intent.getDoubleExtra(EXTRA_WALK_FROM_LAT, lat)
                 val fromLng = intent.getDoubleExtra(EXTRA_WALK_FROM_LNG, lng)
                 startWalk(fromLat, fromLng, lat, lng, speedKmh)
+            }
+            MODE_COUNTRY_TOUR -> {
+                val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 1000.0)
+                val fromLat = intent.getDoubleExtra(EXTRA_TOUR_FROM_LAT, lat)
+                val fromLng = intent.getDoubleExtra(EXTRA_TOUR_FROM_LNG, lng)
+                val dwellSec = intent.getIntExtra(EXTRA_TOUR_DWELL_SEC, 30)
+                val targetsStr = intent.getStringExtra(EXTRA_TOUR_TARGETS) ?: ""
+                val codesStr = intent.getStringExtra(EXTRA_TOUR_CODES) ?: ""
+                val targets = parsePoiList(targetsStr)
+                val codes = codesStr.split(";").filter { it.isNotBlank() }
+                if (targets.isEmpty()) {
+                    updateNotification("TOUR: nessun paese selezionato")
+                    stopSelf()
+                } else {
+                    startCountryTour(fromLat, fromLng, targets, codes, speedKmh, dwellSec)
+                }
             }
             MODE_POI_LOOP -> {
                 val speedKmh = intent.getDoubleExtra(EXTRA_SPEED_KMH, 500.0)
@@ -518,6 +542,84 @@ class MockLocationService : Service() {
             out.add(doubleArrayOf(la, ln))
         }
         return out
+    }
+
+    // ---------------- COUNTRY TOUR: WALK sequenziale dalle attuali coord a N capitali ----------------
+
+    // Ciclo:  da (fromLat,fromLng) -> capitale[0] -> capitale[1] -> ... -> capitale[N-1]
+    //   Ogni tratto: interpolazione lineare a speedKmh (default 1000). Dwell 30s su ogni capitale.
+    //   Notifica progressiva. Broadcast countryCode al completamento tappa.
+    private fun startCountryTour(
+        fromLat: Double, fromLng: Double,
+        targets: List<DoubleArray>,   // [ [lat, lng], ... ] in ordine
+        codes: List<String>,          // codici ISO paralleli a targets, per notifiche
+        speedKmh: Double,
+        dwellSec: Int
+    ) {
+        val speedMs = (speedKmh / 3.6).coerceAtLeast(1.0)
+        val stepM = speedMs * (UPDATE_MS / 1000.0)
+        running = true
+
+        worker = Thread {
+            var curLat = fromLat; var curLng = fromLng
+            for ((idx, tgt) in targets.withIndex()) {
+                if (!running) break
+                val tLat = tgt[0]; val tLng = tgt[1]
+                val code = codes.getOrNull(idx) ?: "?"
+                val cosLat = cos(Math.toRadians((curLat + tLat) / 2.0))
+                val totalM = distM(doubleArrayOf(curLat, curLng), doubleArrayOf(tLat, tLng), cosLat)
+                val bearing = bearingOf(doubleArrayOf(curLat, curLng), doubleArrayOf(tLat, tLng), cosLat)
+                val startLat = curLat; val startLng = curLng
+                var traveled = 0.0
+                updateNotification("TOUR ${idx + 1}/${targets.size}: → $code (${(totalM/1000).toInt()} km)")
+                while (running && traveled < totalM) {
+                    val f = (traveled / totalM).coerceIn(0.0, 1.0)
+                    curLat = startLat + (tLat - startLat) * f
+                    curLng = startLng + (tLng - startLng) * f
+                    push(curLat, curLng, speedMs.toFloat(), bearing)
+                    val cov = (traveled * 100 / totalM.coerceAtLeast(1.0)).toInt().coerceIn(0, 100)
+                    val remaining = ((totalM - traveled) / speedMs).toLong().coerceAtLeast(0)
+                    broadcast(curLat, curLng, cov, remaining)
+                    traveled += stepM
+                    sleep(UPDATE_MS)
+                }
+                if (!running) break
+                curLat = tLat; curLng = tLng
+                push(curLat, curLng, 0f, bearing)
+
+                // dwell su capitale
+                updateNotification("TOUR ${idx + 1}/${targets.size}: gratto $code (dwell ${dwellSec}s)")
+                val t0 = System.currentTimeMillis()
+                while (running && (System.currentTimeMillis() - t0) < dwellSec * 1000L) {
+                    val jLat = tLat + (Math.random() - 0.5) * 0.00002
+                    val jLng = tLng + (Math.random() - 0.5) * 0.00002
+                    push(jLat, jLng, 0f, bearing)
+                    val left = (dwellSec * 1000L - (System.currentTimeMillis() - t0)) / 1000L
+                    broadcast(tLat, tLng, 100, left)
+                    sleep(UPDATE_MS)
+                }
+
+                // notifica UI che questo paese e' fatto (per marcarlo come done in prefs)
+                broadcastCountryDone(code, tLat, tLng)
+            }
+            updateNotification("TOUR completato: ${targets.size} paesi grattati")
+            // resta fisso sull'ultima capitale
+            while (running) {
+                push(curLat, curLng, 0f, 0f)
+                sleep(UPDATE_MS * 3)
+            }
+        }.also { it.start() }
+        updateNotification("TOUR avviato: ${targets.size} paesi da ${fromLat.format(3)},${fromLng.format(3)} @ ${speedKmh.toInt()} km/h")
+    }
+
+    private fun Double.format(digits: Int): String = "%.${digits}f".format(this)
+
+    private fun broadcastCountryDone(code: String, lat: Double, lng: Double) {
+        val i = Intent(ACTION_COUNTRY_DONE).setPackage(packageName)
+        i.putExtra(EXTRA_COUNTRY_CODE, code)
+        i.putExtra(EXTRA_LAT, lat)
+        i.putExtra(EXTRA_LNG, lng)
+        sendBroadcast(i)
     }
 
     // ---------------- WALK: cammino graduale casa -> target per Bump confidence ----------------

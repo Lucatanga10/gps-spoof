@@ -160,6 +160,20 @@
                 android:backgroundTint="#AD1457" />
         </LinearLayout>
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="4dp">
+
+            <Button
+                android:id="@+id/tourButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="TOUR 🌍 (paesi mondo)"
+                android:backgroundTint="#00695C" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/statusText"
             android:layout_width="match_parent"

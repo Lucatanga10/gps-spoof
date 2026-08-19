@@ -163,6 +163,7 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.poiButton)?.setOnClickListener { togglePoiLayer() }
         findViewById<Button>(R.id.amoPoiButton)?.setOnClickListener { importAmoPois() }
         findViewById<Button>(R.id.poiLoopButton)?.setOnClickListener { openPoiLoopDialog() }
+        findViewById<Button>(R.id.tourButton)?.setOnClickListener { openCountryTourDialog() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             askStopConfirm(1)
         }
@@ -1160,6 +1161,211 @@ class MainActivity : Activity() {
         setStatus("POI loop avviato: ${poiTargets.size} POI, dwell ${dwellSec}s, ${if (loops == 0) "∞" else loops.toString()} giri")
     }
 
+    // ---------------- COUNTRY TOUR ----------------
+
+    private val TOUR_PREFS = "country_tour_done"
+    private val TOUR_KEY_DONE = "done_codes"
+
+    private fun getDoneCodes(): MutableSet<String> {
+        val fromPrefs = getSharedPreferences(TOUR_PREFS, Context.MODE_PRIVATE)
+            .getStringSet(TOUR_KEY_DONE, emptySet()) ?: emptySet()
+        // unisci PRE_DONE dei 60 gia' fatti + eventuali aggiunti dopo
+        return (Countries.PRE_DONE union fromPrefs).toMutableSet()
+    }
+
+    private fun saveDoneCodes(done: Set<String>) {
+        getSharedPreferences(TOUR_PREFS, Context.MODE_PRIVATE).edit()
+            .putStringSet(TOUR_KEY_DONE, done).apply()
+    }
+
+    // marca un paese come fatto (chiamato dal broadcast del service durante il tour)
+    private fun markCountryDone(code: String) {
+        val done = getDoneCodes()
+        done.add(code)
+        saveDoneCodes(done)
+    }
+
+    private val tourDoneReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            val code = i?.getStringExtra(MockLocationService.EXTRA_COUNTRY_CODE) ?: return
+            markCountryDone(code)
+            runOnUiThread { toast("Paese fatto: $code (salvato)") }
+        }
+    }
+    private var tourReceiverRegistered = false
+
+    private fun openCountryTourDialog() {
+        if (!hasLocationPermission()) { requestPermissions(); toast("Concedi permesso posizione"); return }
+
+        // filtra: mostra SOLO paesi NON fatti
+        val done = getDoneCodes()
+        val available = Countries.ALL.filter { it.code !in done }.sortedBy { it.name }
+        if (available.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("Hai fatto TUTTI i paesi!")
+                .setMessage("Nessun paese rimasto. Se vuoi resettare la lista dei fatti, tienimi premuto qui.")
+                .setPositiveButton("OK") { d, _ -> d.dismiss() }
+                .setNeutralButton("RESET tutti (rifai da zero)") { _, _ ->
+                    saveDoneCodes(emptySet())
+                    toast("Reset fatto. Riapri TOUR.")
+                }
+                .show()
+            return
+        }
+
+        // stato selezione (in-dialog)
+        val selectedCodes = LinkedHashSet<String>()
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 12, 24, 12)
+        }
+        val info = TextView(this).apply {
+            text = "Paesi disponibili: ${available.size}  (fatti: ${done.size})\n" +
+                "Tap paese = selezionato. Tap di nuovo = deselezionato.\n" +
+                "Ordine visita = ordine in cui li selezioni."
+            textSize = 12f
+            setPadding(0, 0, 0, 12)
+        }
+        val counter = TextView(this).apply {
+            text = "Selezionati: 0"
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setPadding(0, 0, 0, 8)
+        }
+        val search = EditText(this).apply {
+            hint = "Filtra paesi (nome)"
+            setSingleLine(true)
+        }
+        container.addView(info)
+        container.addView(counter)
+        container.addView(search)
+
+        // scroll con checkbox
+        val scroll = android.widget.ScrollView(this)
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(list)
+
+        // funzione ricostruzione lista visibile (con filtro search)
+        fun rebuildList(filter: String) {
+            list.removeAllViews()
+            val q = filter.trim().lowercase()
+            for (c in available) {
+                if (q.isNotEmpty() && !c.name.lowercase().contains(q) && !c.code.lowercase().contains(q)) continue
+                val cb = android.widget.CheckBox(this).apply {
+                    text = "${c.name}  (${c.code})"
+                    isChecked = c.code in selectedCodes
+                    setOnCheckedChangeListener { _, checked ->
+                        if (checked) selectedCodes.add(c.code) else selectedCodes.remove(c.code)
+                        counter.text = "Selezionati: ${selectedCodes.size}"
+                    }
+                }
+                list.addView(cb)
+            }
+        }
+        rebuildList("")
+        search.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { rebuildList(s?.toString() ?: "") }
+        })
+
+        // scelta rapida "seleziona tutti visibili" + "deseleziona tutto"
+        val quickRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 8, 0, 8)
+        }
+        val btnAll = Button(this).apply {
+            text = "TUTTI"
+            setOnClickListener {
+                for (c in available) selectedCodes.add(c.code)
+                counter.text = "Selezionati: ${selectedCodes.size}"
+                rebuildList(search.text.toString())
+            }
+        }
+        val btnNone = Button(this).apply {
+            text = "NESSUNO"
+            setOnClickListener {
+                selectedCodes.clear()
+                counter.text = "Selezionati: 0"
+                rebuildList(search.text.toString())
+            }
+        }
+        quickRow.addView(btnAll)
+        quickRow.addView(btnNone)
+        container.addView(quickRow)
+
+        // config dwell
+        val dwellLabel = TextView(this).apply { setPadding(0, 8, 0, 0) }
+        val dwellSeek = SeekBar(this).apply { max = 300; progress = 20 }  // 10..310s, default 30
+        fun updateDwell() { dwellLabel.text = "Dwell su capitale: ${10 + dwellSeek.progress}s" }
+        dwellSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) = updateDwell()
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        updateDwell()
+        container.addView(dwellLabel)
+        container.addView(dwellSeek)
+
+        val hint = TextView(this).apply {
+            text = "Velocita walk = seekbar principale (attualmente $speedKmh km/h). " +
+                "Consiglio 1000+ km/h per tour veloce.\n\n" +
+                "Ordine visita = ordine di selezione (primo cliccato = prima tappa)."
+            setPadding(0, 12, 0, 0)
+            textSize = 11f
+        }
+        container.addView(hint)
+
+        // scroll principale contiene tutto (info + counter + search + quickrow + list + dwell + hint)
+        val outer = android.widget.ScrollView(this)
+        val outerContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        outerContainer.addView(container)
+        outerContainer.addView(scroll)
+        outer.addView(outerContainer)
+
+        AlertDialog.Builder(this)
+            .setTitle("TOUR paesi mondo (${available.size} disponibili)")
+            .setView(outer)
+            .setPositiveButton("AVVIA TOUR") { _, _ ->
+                if (selectedCodes.isEmpty()) { toast("Seleziona almeno un paese"); return@setPositiveButton }
+                val dwellSec = 10 + dwellSeek.progress
+                launchCountryTour(selectedCodes.toList(), dwellSec)
+            }
+            .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
+            .show()
+    }
+
+    private fun launchCountryTour(codes: List<String>, dwellSec: Int) {
+        // pos partenza = ultima posizione reale (o pin manuale)
+        val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        var fromLat = centerPoint?.latitude ?: 44.6469
+        var fromLng = centerPoint?.longitude ?: 10.9252
+        try {
+            val real = lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.PASSIVE_PROVIDER)
+            if (real != null) { fromLat = real.latitude; fromLng = real.longitude }
+        } catch (_: Exception) {}
+
+        val targets = codes.mapNotNull { Countries.byCode(it) }
+        if (targets.isEmpty()) { toast("Nessun paese valido"); return }
+        val targetsStr = targets.joinToString(";") { "${it.capitalLat},${it.capitalLng}" }
+        val codesStr = targets.joinToString(";") { it.code }
+
+        clearLiveOverlays()
+        val i = Intent(this, MockLocationService::class.java).apply {
+            putExtra(MockLocationService.EXTRA_MODE, MockLocationService.MODE_COUNTRY_TOUR)
+            putExtra(MockLocationService.EXTRA_TOUR_FROM_LAT, fromLat)
+            putExtra(MockLocationService.EXTRA_TOUR_FROM_LNG, fromLng)
+            putExtra(MockLocationService.EXTRA_TOUR_TARGETS, targetsStr)
+            putExtra(MockLocationService.EXTRA_TOUR_CODES, codesStr)
+            putExtra(MockLocationService.EXTRA_TOUR_DWELL_SEC, dwellSec)
+            putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
+        }
+        startForegroundService(i)
+        setStatus("TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s @ $speedKmh km/h")
+    }
+
     // firma della zona: distingue un giro salvato per confine citta o per cerchio
     private fun computeSig(): String {
         val b = boundaryRings
@@ -1214,17 +1420,28 @@ class MainActivity : Activity() {
             }
             receiverRegistered = true
         }
+        if (!tourReceiverRegistered) {
+            val f2 = IntentFilter(MockLocationService.ACTION_COUNTRY_DONE)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(tourDoneReceiver, f2, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(tourDoneReceiver, f2)
+            }
+            tourReceiverRegistered = true
+        }
     }
 
     override fun onPause() {
         super.onPause()
         map.onPause()
         if (receiverRegistered) {
-            try {
-                unregisterReceiver(updateReceiver)
-            } catch (e: Exception) {
-            }
+            try { unregisterReceiver(updateReceiver) } catch (e: Exception) {}
             receiverRegistered = false
+        }
+        if (tourReceiverRegistered) {
+            try { unregisterReceiver(tourDoneReceiver) } catch (e: Exception) {}
+            tourReceiverRegistered = false
         }
     }
 }
