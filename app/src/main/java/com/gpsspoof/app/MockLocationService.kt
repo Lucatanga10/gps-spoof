@@ -267,10 +267,10 @@ class MockLocationService : Service() {
         updateNotification("Serpentina citta avviata (${verts.size} punti, ${speedKmh} km/h)")
     }
 
-    // ---------------- TURBO: teleport hex-by-hex, 1 push = 1 esagono grattato ----------------
+    // ---------------- TURBO: teleport hex-by-hex STREAMING (no OOM su continenti) ----------------
 
-    // enumerare griglia esagonale dentro il poligono, iterare in serpentina, push center di ogni cella.
-    // niente cammino, niente interpolazione: ogni tick = 1 esagono nuovo garantito.
+    // Enumera griglia esagonale dentro poligono. Streaming: mai piu di 1 riga in RAM.
+    // Africa / mondo intero = ok, non alloca tutti gli hex upfront.
     private fun startTurbo(rings: List<List<DoubleArray>>, hexStepM: Double, pushMs: Long, pushesPerHex: Int, sig: String) {
         val stepM = if (hexStepM > 20.0) hexStepM else DEFAULT_HEX_STEP_M
         val tickMs = if (pushMs in 30..5000) pushMs else DEFAULT_TURBO_MS
@@ -285,65 +285,103 @@ class MockLocationService : Service() {
         val cLat = (minLat + maxLat) / 2.0
         val cosLat = cos(Math.toRadians(cLat))
         val stepLat = stepM / METERS_PER_DEG
-        val stepLng = stepM / (METERS_PER_DEG * cosLat)
-        val rowHeight = stepLat * 0.866  // sqrt(3)/2 per griglia esagonale piena
+        val stepLngAtCenter = stepM / (METERS_PER_DEG * cosLat)
+        val rowHeight = stepLat * 0.866  // sqrt(3)/2
 
-        // costruisci punti: righe sfalsate stile hex-grid, filtro point-in-polygon, serpentina
-        val points = ArrayList<DoubleArray>()
-        var lat = minLat
-        var row = 0
-        while (lat <= maxLat) {
-            val rowPts = ArrayList<DoubleArray>()
-            var lng = minLng + (if (row % 2 == 1) stepLng / 2.0 else 0.0)
-            while (lng <= maxLng) {
-                if (pointInRings(lat, lng, rings)) rowPts.add(doubleArrayOf(lat, lng))
-                lng += stepLng
+        // stima total hex (per progress %) — non alloca nulla, solo conteggio dimensionale
+        val bboxAreaM2 = (maxLat - minLat) * METERS_PER_DEG * (maxLng - minLng) * METERS_PER_DEG * cosLat
+        val hexAreaM2 = stepM * stepM * 0.866  // hex area approx
+        val estTotal = (bboxAreaM2 / hexAreaM2).toLong().coerceAtLeast(1)
+
+        // SPATIAL INDEX per point-in-polygon veloce su poligoni giganti (Africa 5000+ vertici)
+        // Per ogni ring, precalcola bbox. Cella fuori bbox = skip poly test.
+        val ringBboxes = rings.map { ring ->
+            var rMinLat = 90.0; var rMaxLat = -90.0; var rMinLng = 180.0; var rMaxLng = -180.0
+            for (p in ring) {
+                if (p[0] < rMinLat) rMinLat = p[0]; if (p[0] > rMaxLat) rMaxLat = p[0]
+                if (p[1] < rMinLng) rMinLng = p[1]; if (p[1] > rMaxLng) rMaxLng = p[1]
             }
-            if (row % 2 == 1) rowPts.reverse()  // serpentina alterna direzione
-            points.addAll(rowPts)
-            lat += rowHeight
-            row++
+            doubleArrayOf(rMinLat, rMaxLat, rMinLng, rMaxLng)
         }
 
-        if (points.isEmpty()) {
-            updateNotification("Turbo: nessun esagono dentro il confine")
-            stopSelf(); return
-        }
+        // Per zone MOLTO grandi (continenti), skippa point-in-polygon del tutto — usa solo bbox.
+        // Anche se coord finisce in mare/deserto vuoto amo grattera se in zona reale.
+        val skipPolyTest = bboxAreaM2 > 500_000_000_000.0  // > 500,000 km²
 
-        val totalHex = points.size
         running = true
         worker = Thread {
-            var idx = 0
+            var idx = 0L
             var lastBearing = 0f
-            while (running) {
-                val p = points[idx]
-                if (idx > 0) {
-                    val prev = points[idx - 1]
-                    lastBearing = bearingOf(prev, p, cosLat)
+            var currentLat = minLat
+            var currentRow = 0
+            var rowPts = ArrayList<DoubleArray>()
+            var idxInRow = 0
+            var prevCell: DoubleArray? = null
+
+            // genera prossima cella streaming (mai memoria per tutto)
+            fun nextCell(): DoubleArray? {
+                while (rowPts.isEmpty() || idxInRow >= rowPts.size) {
+                    if (currentLat > maxLat) {
+                        // wrap around: ricomincia dall'inizio
+                        currentLat = minLat
+                        currentRow = 0
+                    }
+                    rowPts.clear()
+                    val cosLatRow = cos(Math.toRadians(currentLat)).coerceAtLeast(0.01)
+                    val stepLngRow = stepM / (METERS_PER_DEG * cosLatRow)
+                    var lng = minLng + (if (currentRow % 2 == 1) stepLngRow / 2.0 else 0.0)
+                    while (lng <= maxLng) {
+                        val inZone = if (skipPolyTest) {
+                            true
+                        } else {
+                            // check ring bboxes prima (veloce)
+                            var maybe = false
+                            for (bb in ringBboxes) {
+                                if (currentLat in bb[0]..bb[1] && lng in bb[2]..bb[3]) { maybe = true; break }
+                            }
+                            if (maybe) pointInRings(currentLat, lng, rings) else false
+                        }
+                        if (inZone) rowPts.add(doubleArrayOf(currentLat, lng))
+                        lng += stepLngRow
+                    }
+                    if (currentRow % 2 == 1) rowPts.reverse()
+                    idxInRow = 0
+                    currentLat += rowHeight
+                    currentRow++
+                    if (rowPts.isNotEmpty()) break
                 }
-                // ripeti push sullo stesso hex N volte: aumenta chance che il server ne accetti almeno 1
+                if (idxInRow < rowPts.size) return rowPts[idxInRow++]
+                return null
+            }
+
+            updateNotification("Turbo streaming: ~${estTotal / 1000}k hex stimati, ${1000L/tickMs}push/sec x$repeats")
+
+            while (running) {
+                val p = nextCell() ?: run {
+                    updateNotification("Turbo: nessuna cella nella zona")
+                    return@Thread
+                }
+                prevCell?.let { lastBearing = bearingOf(it, p, cos(Math.toRadians(p[0]))) }
                 for (r in 0 until repeats) {
                     if (!running) break
-                    // micro-jitter sulle coord per non essere ESATTAMENTE fisso (piu credibile)
                     val jitLat = p[0] + (Math.random() - 0.5) * 0.00003
                     val jitLng = p[1] + (Math.random() - 0.5) * 0.00003
                     push(jitLat, jitLng, 8f, lastBearing)
-                    saveProgress(sig, idx.toDouble(), totalHex.toDouble(), jitLat, jitLng)
                     if (r == 0) {
-                        val cov = (idx * 100 / totalHex).coerceIn(0, 100)
-                        val remaining = ((totalHex - idx).toLong() * repeats * tickMs / 1000L)
+                        saveProgress(sig, idx.toDouble(), estTotal.toDouble(), jitLat, jitLng)
+                        val cov = ((idx * 100 / estTotal.coerceAtLeast(1)).toInt()).coerceIn(0, 100)
+                        val remaining = ((estTotal - idx) * repeats * tickMs / 1000L).coerceAtLeast(0)
                         broadcast(jitLat, jitLng, cov, remaining)
-                        if (idx % 50 == 0) {
-                            updateNotification("Turbo: $idx/$totalHex hex ($cov%, ${repeats}x/hex)")
+                        if (idx % 50L == 0L) {
+                            updateNotification("Turbo: ${idx}/~${estTotal} hex ($cov%, ${repeats}x/hex)")
                         }
                     }
                     sleep(tickMs)
                 }
+                prevCell = p
                 idx++
-                if (idx >= totalHex) idx = 0  // giro completato, ricomincia
             }
         }.also { it.start() }
-        updateNotification("Turbo avviato: $totalHex hex, ${1000/tickMs}push/sec x${repeats}")
     }
 
     // ray casting even-odd point-in-polygon (buchi supportati via anelli multipli)

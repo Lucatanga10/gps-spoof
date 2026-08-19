@@ -304,6 +304,20 @@ class MainActivity : Activity() {
         val label = findViewById<TextView>(R.id.etaLabel) ?: return
         val b = boundaryRings
         if (b != null) {
+            // per continenti (10k+ vertici o area giga) salta la serpentine build (OOM).
+            // Stima approx via bbox area.
+            val totalVerts = b.sumOf { it.size }
+            if (totalVerts > 20000) {
+                var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+                for (ring in b) for (p in ring) {
+                    minLat = min(minLat, p.latitude); maxLat = max(maxLat, p.latitude)
+                    minLng = min(minLng, p.longitude); maxLng = max(maxLng, p.longitude)
+                }
+                val areaKm2 = (maxLat - minLat) * 111.0 * (maxLng - minLng) * 111.0 *
+                              cos(Math.toRadians((minLat + maxLat) / 2))
+                label.text = "Zona giga (~${areaKm2.toInt()} km²) - stima ETA saltata per performance"
+                return
+            }
             val pts = buildSerpentineBoundary(b)
             var m = 0.0
             for (i in 1 until pts.size) m += distMeters(pts[i - 1], pts[i])
@@ -428,12 +442,21 @@ class MainActivity : Activity() {
         clearBoundaryOverlays()
         val rings = boundaryRings ?: return
         var minLat = 90.0; var maxLat = -90.0; var minLng = 180.0; var maxLng = -180.0
+
+        // subsample vertici: continenti hanno 100k+ vertici, osmdroid OOM.
+        // Cap 3000 vertici per ring, mantenendo forma generale.
+        val MAX_VERTS_PER_RING = 3000
         for (ring in rings) {
+            val drawRing = if (ring.size <= MAX_VERTS_PER_RING) ring
+                          else {
+                              val step = (ring.size + MAX_VERTS_PER_RING - 1) / MAX_VERTS_PER_RING
+                              ring.filterIndexed { i, _ -> i % step == 0 || i == ring.size - 1 }
+                          }
             val poly = Polygon(map)
             poly.outlinePaint.color = Color.YELLOW
             poly.outlinePaint.strokeWidth = 5f
             poly.fillPaint.color = Color.argb(40, 0, 150, 255)
-            poly.points = ring
+            poly.points = drawRing
             boundaryOverlays.add(poly)
             map.overlays.add(poly)
             for (p in ring) {
@@ -559,13 +582,19 @@ class MainActivity : Activity() {
         clearPlannedOverlays()
         val b = boundaryRings
         if (b != null) {
+            val MAX_VERTS = 3000
             for (ring in b) {
                 if (ring.size < 3) continue
+                val drawRing = if (ring.size <= MAX_VERTS) ring
+                              else {
+                                  val step = (ring.size + MAX_VERTS - 1) / MAX_VERTS
+                                  ring.filterIndexed { i, _ -> i % step == 0 || i == ring.size - 1 }
+                              }
                 val poly = Polygon(map)
                 poly.outlinePaint.color = Color.argb(255, 200, 0, 0)
                 poly.outlinePaint.strokeWidth = 3f
                 poly.fillPaint.color = Color.argb(150, 220, 0, 0)
-                poly.points = ring
+                poly.points = drawRing
                 plannedOverlays.add(poly)
                 map.overlays.add(poly)
             }
