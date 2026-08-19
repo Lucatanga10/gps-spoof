@@ -161,6 +161,7 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.turboButton)?.setOnClickListener { startTurbo() }
         findViewById<Button>(R.id.walkButton)?.setOnClickListener { startWalk() }
         findViewById<Button>(R.id.poiButton)?.setOnClickListener { togglePoiLayer() }
+        findViewById<Button>(R.id.amoPoiButton)?.setOnClickListener { importAmoPois() }
         findViewById<Button>(R.id.poiLoopButton)?.setOnClickListener { openPoiLoopDialog() }
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             askStopConfirm(1)
@@ -944,6 +945,68 @@ class MainActivity : Activity() {
         for (m in poiMarkers) map.overlays.remove(m)
         poiMarkers.clear()
         map.invalidate()
+    }
+
+    // importa POI catturate da amo via Frida amo-places-dump.js
+    // path candidati (in ordine, primo che esiste vince):
+    //   1. /sdcard/Android/data/com.gpsspoof.app/files/amo_places.json  (no permission)
+    //   2. /sdcard/Download/amo_places.json                             (path Frida default)
+    private fun importAmoPois() {
+        val paths = listOfNotNull(
+            java.io.File(getExternalFilesDir(null), "amo_places.json"),
+            java.io.File("/sdcard/Download/amo_places.json"),
+            java.io.File("/storage/emulated/0/Download/amo_places.json")
+        )
+        val src = paths.firstOrNull { it.exists() && it.length() > 0 }
+        if (src == null) {
+            AlertDialog.Builder(this)
+                .setTitle("File amo_places.json non trovato")
+                .setMessage(
+                    "Cercato in:\n" + paths.joinToString("\n") { "• ${it.absolutePath}" } +
+                    "\n\nPer generarlo:\n" +
+                    "1. avvia frida-server sul telefono\n" +
+                    "2. sul PC: frida -U -f co.amo.android.location -l amo-places-dump.js --no-pause\n" +
+                    "3. in amo apri PLACES tab, scorri la lista, cerca posti\n" +
+                    "4. adb pull /sdcard/Download/amo_places.json\n" +
+                    "5. adb push amo_places.json ${paths[0].absolutePath}"
+                )
+                .setPositiveButton("OK") { d, _ -> d.dismiss() }
+                .show()
+            return
+        }
+        setStatus("Leggo POI amo da ${src.absolutePath}...")
+        Thread {
+            try {
+                val txt = src.readText(Charsets.UTF_8)
+                val arr = JSONArray(txt)
+                val pois = ArrayList<PoiRepository.Poi>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val id = o.optString("id").hashCode().toLong()  // string id → long stabile
+                    val name = o.optString("name", "(senza nome)")
+                    val lat = o.optDouble("lat", Double.NaN)
+                    val lng = o.optDouble("lng", Double.NaN)
+                    val cat = o.optString("category", "amo")
+                    if (lat.isNaN() || lng.isNaN()) continue
+                    pois.add(PoiRepository.Poi(id, name, lat, lng, "amo", "AMO — $cat"))
+                }
+                runOnUiThread {
+                    if (pois.isEmpty()) { toast("File vuoto o senza POI validi"); return@runOnUiThread }
+                    // filtro sulla bbox visibile per non mostrare 10k pin
+                    val bb = map.boundingBox
+                    val visible = if (bb != null) pois.filter {
+                        it.lat in bb.latSouth..bb.latNorth && it.lng in bb.lonWest..bb.lonEast
+                    } else pois
+                    val toShow = if (visible.size < 5 && pois.isNotEmpty()) pois.take(2000) else visible.take(2000)
+                    lastPoiFetch = toShow
+                    drawPoiMarkers(toShow)
+                    poiLayerOn = true
+                    setStatus("Amo POI: ${toShow.size} visibili (${pois.size} totali). Tocca per aggiungere alla lista visite.")
+                }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Errore parsing amo_places.json: ${e.message}") }
+            }
+        }.start()
     }
 
     private fun openPoiLoopDialog() {
