@@ -1362,10 +1362,24 @@ class MainActivity : Activity() {
             if (real != null) { fromLat = real.latitude; fromLng = real.longitude }
         } catch (_: Exception) {}
 
-        val targets = codes.mapNotNull { Countries.byCode(it) }
-        if (targets.isEmpty()) { toast("Nessun paese valido"); return }
+        val rawTargets = codes.mapNotNull { Countries.byCode(it) }
+        if (rawTargets.isEmpty()) { toast("Nessun paese valido"); return }
+
+        // TSP nearest-neighbor: ordina paesi per prossimita, partendo dalla mia posizione
+        val targets = tspNearestNeighbor(fromLat, fromLng, rawTargets)
         val targetsStr = targets.joinToString(";") { "${it.capitalLat},${it.capitalLng}" }
         val codesStr = targets.joinToString(";") { it.code }
+
+        // calcola distanza totale + ETA
+        var totalKm = distKm(fromLat, fromLng, targets[0].capitalLat, targets[0].capitalLng)
+        for (i in 1 until targets.size) {
+            totalKm += distKm(
+                targets[i-1].capitalLat, targets[i-1].capitalLng,
+                targets[i].capitalLat, targets[i].capitalLng
+            )
+        }
+        val etaHours = totalKm / speedKmh + (targets.size * dwellSec / 3600.0)
+        toast("TSP: ${targets.size} paesi, ${"%.0f".format(totalKm)} km totali, ETA ~${"%.1f".format(etaHours)}h a $speedKmh km/h")
 
         clearLiveOverlays()
         val i = Intent(this, MockLocationService::class.java).apply {
@@ -1383,6 +1397,32 @@ class MainActivity : Activity() {
         val etaMin = if (teleport) (targets.size * dwellSec / 60) else null
         val etaStr = if (etaMin != null) " (~${etaMin} min)" else ""
         setStatus("$mode TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s$etaStr")
+    }
+
+    // TSP nearest-neighbor: partendo da (fromLat, fromLng), sceglie sempre il paese non visitato piu vicino
+    private fun tspNearestNeighbor(fromLat: Double, fromLng: Double, countries: List<Countries.Country>): List<Countries.Country> {
+        val remaining = countries.toMutableList()
+        val ordered = ArrayList<Countries.Country>()
+        var curLat = fromLat; var curLng = fromLng
+        while (remaining.isNotEmpty()) {
+            var bestIdx = 0
+            var bestDist = Double.MAX_VALUE
+            for (i in remaining.indices) {
+                val d = distKm(curLat, curLng, remaining[i].capitalLat, remaining[i].capitalLng)
+                if (d < bestDist) { bestDist = d; bestIdx = i }
+            }
+            val chosen = remaining.removeAt(bestIdx)
+            ordered.add(chosen)
+            curLat = chosen.capitalLat; curLng = chosen.capitalLng
+        }
+        return ordered
+    }
+
+    private fun distKm(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+        val cosLat = cos(Math.toRadians((lat1 + lat2) / 2))
+        val dLat = (lat2 - lat1) * 111.0
+        val dLng = (lng2 - lng1) * 111.0 * cosLat
+        return sqrt(dLat * dLat + dLng * dLng)
     }
 
     // firma della zona: distingue un giro salvato per confine citta o per cerchio
