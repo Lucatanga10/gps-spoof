@@ -61,6 +61,7 @@ class MockLocationService : Service() {
         const val EXTRA_TOUR_DWELL_SEC = "tour_dwell_sec"
         const val EXTRA_TOUR_FROM_LAT = "tour_from_lat"
         const val EXTRA_TOUR_FROM_LNG = "tour_from_lng"
+        const val EXTRA_TOUR_TELEPORT = "tour_teleport"  // true = skip walk, jump direct
         const val ACTION_UPDATE = "com.gpsspoof.app.UPDATE"
         const val ACTION_COUNTRY_DONE = "com.gpsspoof.app.COUNTRY_DONE"
         const val EXTRA_COUNTRY_CODE = "country_code"
@@ -177,6 +178,7 @@ class MockLocationService : Service() {
                 val fromLat = intent.getDoubleExtra(EXTRA_TOUR_FROM_LAT, lat)
                 val fromLng = intent.getDoubleExtra(EXTRA_TOUR_FROM_LNG, lng)
                 val dwellSec = intent.getIntExtra(EXTRA_TOUR_DWELL_SEC, 30)
+                val teleport = intent.getBooleanExtra(EXTRA_TOUR_TELEPORT, false)
                 val targetsStr = intent.getStringExtra(EXTRA_TOUR_TARGETS) ?: ""
                 val codesStr = intent.getStringExtra(EXTRA_TOUR_CODES) ?: ""
                 val targets = parsePoiList(targetsStr)
@@ -184,6 +186,8 @@ class MockLocationService : Service() {
                 if (targets.isEmpty()) {
                     updateNotification("TOUR: nessun paese selezionato")
                     stopSelf()
+                } else if (teleport) {
+                    startCountryTourTeleport(targets, codes, dwellSec)
                 } else {
                     startCountryTour(fromLat, fromLng, targets, codes, speedKmh, dwellSec)
                 }
@@ -610,6 +614,60 @@ class MockLocationService : Service() {
             }
         }.also { it.start() }
         updateNotification("TOUR avviato: ${targets.size} paesi da ${fromLat.format(3)},${fromLng.format(3)} @ ${speedKmh.toInt()} km/h")
+    }
+
+    // TELEPORT: nessun walk, salta direttamente sulla capitale + dwell breve.
+    // Ordine paesi = quello passato (idealmente TSP nearest-neighbor per bearing realistico).
+    private fun startCountryTourTeleport(
+        targets: List<DoubleArray>,
+        codes: List<String>,
+        dwellSec: Int
+    ) {
+        running = true
+        worker = Thread {
+            var totalDone = 0
+            for ((idx, tgt) in targets.withIndex()) {
+                if (!running) break
+                val tLat = tgt[0]; val tLng = tgt[1]
+                val code = codes.getOrNull(idx) ?: "?"
+
+                // TELETRASPORTO: 3 push rapidi per assicurare che amo capti il fix
+                for (r in 0 until 3) {
+                    if (!running) break
+                    val jLat = tLat + (Math.random() - 0.5) * 0.00002
+                    val jLng = tLng + (Math.random() - 0.5) * 0.00002
+                    push(jLat, jLng, 0f, 0f)
+                    sleep(150)
+                }
+                if (!running) break
+
+                updateNotification("TELEPORT ${idx + 1}/${targets.size}: $code (dwell ${dwellSec}s)")
+
+                // dwell su capitale (con micro-jitter GPS)
+                val t0 = System.currentTimeMillis()
+                while (running && (System.currentTimeMillis() - t0) < dwellSec * 1000L) {
+                    val jLat = tLat + (Math.random() - 0.5) * 0.00002
+                    val jLng = tLng + (Math.random() - 0.5) * 0.00002
+                    push(jLat, jLng, 0f, 0f)
+                    val left = (dwellSec * 1000L - (System.currentTimeMillis() - t0)) / 1000L
+                    broadcast(tLat, tLng, 100, left)
+                    sleep(UPDATE_MS)
+                }
+                if (!running) break
+
+                totalDone++
+                broadcastCountryDone(code, tLat, tLng)
+            }
+            updateNotification("TELEPORT TOUR completato: $totalDone/${targets.size} paesi")
+            // resta fisso su ultima capitale
+            val last = targets.lastOrNull()
+            while (running && last != null) {
+                push(last[0], last[1], 0f, 0f)
+                sleep(UPDATE_MS * 3)
+            }
+        }.also { it.start() }
+        val eta = targets.size * dwellSec / 60
+        updateNotification("TELEPORT TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s (~${eta} min totali)")
     }
 
     private fun Double.format(digits: Int): String = "%.${digits}f".format(this)

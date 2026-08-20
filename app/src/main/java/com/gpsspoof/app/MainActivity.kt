@@ -1294,10 +1294,10 @@ class MainActivity : Activity() {
         quickRow.addView(btnNone)
         container.addView(quickRow)
 
-        // config dwell
+        // config dwell (parte da 3s, min 3, max 300)
         val dwellLabel = TextView(this).apply { setPadding(0, 8, 0, 0) }
-        val dwellSeek = SeekBar(this).apply { max = 300; progress = 20 }  // 10..310s, default 30
-        fun updateDwell() { dwellLabel.text = "Dwell su capitale: ${10 + dwellSeek.progress}s" }
+        val dwellSeek = SeekBar(this).apply { max = 297; progress = 7 }  // 3..300s, default 10
+        fun updateDwell() { dwellLabel.text = "Dwell su capitale: ${3 + dwellSeek.progress}s" }
         dwellSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) = updateDwell()
             override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -1306,6 +1306,20 @@ class MainActivity : Activity() {
         updateDwell()
         container.addView(dwellLabel)
         container.addView(dwellSeek)
+
+        // TELEPORT checkbox
+        val teleportCb = android.widget.CheckBox(this).apply {
+            text = "TELEPORT (salta walk, salti direttamente al paese)"
+            isChecked = true  // default ON, molto piu veloce
+            setPadding(0, 12, 0, 0)
+        }
+        container.addView(teleportCb)
+        val teleportInfo = TextView(this).apply {
+            text = "Con TELEPORT: 195 paesi × dwell = ~30 min totali\nSenza (walk): giorni. Con teleport, il patch anti-cheat basta."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+        }
+        container.addView(teleportInfo)
 
         val hint = TextView(this).apply {
             text = "Velocita walk = seekbar principale (attualmente $speedKmh km/h). " +
@@ -1328,14 +1342,15 @@ class MainActivity : Activity() {
             .setView(outer)
             .setPositiveButton("AVVIA TOUR") { _, _ ->
                 if (selectedCodes.isEmpty()) { toast("Seleziona almeno un paese"); return@setPositiveButton }
-                val dwellSec = 10 + dwellSeek.progress
-                launchCountryTour(selectedCodes.toList(), dwellSec)
+                val dwellSec = 3 + dwellSeek.progress
+                val teleport = teleportCb.isChecked
+                launchCountryTour(selectedCodes.toList(), dwellSec, teleport)
             }
             .setNegativeButton("Annulla") { d, _ -> d.dismiss() }
             .show()
     }
 
-    private fun launchCountryTour(codes: List<String>, dwellSec: Int) {
+    private fun launchCountryTour(codes: List<String>, dwellSec: Int, teleport: Boolean) {
         // pos partenza = ultima posizione reale (o pin manuale)
         val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
         var fromLat = centerPoint?.latitude ?: 44.6469
@@ -1360,10 +1375,14 @@ class MainActivity : Activity() {
             putExtra(MockLocationService.EXTRA_TOUR_TARGETS, targetsStr)
             putExtra(MockLocationService.EXTRA_TOUR_CODES, codesStr)
             putExtra(MockLocationService.EXTRA_TOUR_DWELL_SEC, dwellSec)
+            putExtra(MockLocationService.EXTRA_TOUR_TELEPORT, teleport)
             putExtra(MockLocationService.EXTRA_SPEED_KMH, speedKmh.toDouble())
         }
         startForegroundService(i)
-        setStatus("TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s @ $speedKmh km/h")
+        val mode = if (teleport) "TELEPORT" else "WALK"
+        val etaMin = if (teleport) (targets.size * dwellSec / 60) else null
+        val etaStr = if (etaMin != null) " (~${etaMin} min)" else ""
+        setStatus("$mode TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s$etaStr")
     }
 
     // firma della zona: distingue un giro salvato per confine citta o per cerchio
