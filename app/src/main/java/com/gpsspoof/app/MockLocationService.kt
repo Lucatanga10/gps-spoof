@@ -616,8 +616,9 @@ class MockLocationService : Service() {
         updateNotification("TOUR avviato: ${targets.size} paesi da ${fromLat.format(3)},${fromLng.format(3)} @ ${speedKmh.toInt()} km/h")
     }
 
-    // TELEPORT: nessun walk, salta direttamente sulla capitale + dwell breve.
-    // Ordine paesi = quello passato (idealmente TSP nearest-neighbor per bearing realistico).
+    // TELEPORT: nessun walk, salta direttamente sulla capitale + push burst intensivo
+    // Amo probabilmente vuole cluster di N sample nella stessa hex per committare scratch.
+    // Push a 5Hz (200ms) durante tutto dwell = tanti sample → cluster satisfatto.
     private fun startCountryTourTeleport(
         targets: List<DoubleArray>,
         codes: List<String>,
@@ -626,32 +627,35 @@ class MockLocationService : Service() {
         running = true
         worker = Thread {
             var totalDone = 0
+            val pushIntervalMs = 200L  // 5 push/sec
             for ((idx, tgt) in targets.withIndex()) {
                 if (!running) break
                 val tLat = tgt[0]; val tLng = tgt[1]
                 val code = codes.getOrNull(idx) ?: "?"
 
-                // TELETRASPORTO: 3 push rapidi per assicurare che amo capti il fix
-                for (r in 0 until 3) {
+                // Burst iniziale: 10 push rapidi (50ms apart) per fix immediato
+                for (r in 0 until 10) {
                     if (!running) break
                     val jLat = tLat + (Math.random() - 0.5) * 0.00002
                     val jLng = tLng + (Math.random() - 0.5) * 0.00002
                     push(jLat, jLng, 0f, 0f)
-                    sleep(150)
+                    sleep(50)
                 }
                 if (!running) break
 
-                updateNotification("TELEPORT ${idx + 1}/${targets.size}: $code (dwell ${dwellSec}s)")
+                updateNotification("TELEPORT ${idx + 1}/${targets.size}: $code (dwell ${dwellSec}s, burst 5Hz)")
 
-                // dwell su capitale (con micro-jitter GPS)
+                // dwell con push 5Hz sulla capitale (satisfare cluster N di amo)
                 val t0 = System.currentTimeMillis()
+                var pushCount = 0
                 while (running && (System.currentTimeMillis() - t0) < dwellSec * 1000L) {
                     val jLat = tLat + (Math.random() - 0.5) * 0.00002
                     val jLng = tLng + (Math.random() - 0.5) * 0.00002
                     push(jLat, jLng, 0f, 0f)
+                    pushCount++
                     val left = (dwellSec * 1000L - (System.currentTimeMillis() - t0)) / 1000L
                     broadcast(tLat, tLng, 100, left)
-                    sleep(UPDATE_MS)
+                    sleep(pushIntervalMs)
                 }
                 if (!running) break
 
@@ -659,7 +663,6 @@ class MockLocationService : Service() {
                 broadcastCountryDone(code, tLat, tLng)
             }
             updateNotification("TELEPORT TOUR completato: $totalDone/${targets.size} paesi")
-            // resta fisso su ultima capitale
             val last = targets.lastOrNull()
             while (running && last != null) {
                 push(last[0], last[1], 0f, 0f)
