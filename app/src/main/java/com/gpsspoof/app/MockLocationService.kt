@@ -616,8 +616,9 @@ class MockLocationService : Service() {
         updateNotification("TOUR avviato: ${targets.size} paesi da ${fromLat.format(3)},${fromLng.format(3)} @ ${speedKmh.toInt()} km/h")
     }
 
-    // TELEPORT con GPS LOSS gap: tra paesi non pusho niente per N sec.
-    // Amo (se ha "GPS assente > X → reset") riparte fresh su nuova coord senza speed check.
+    // TELEPORT con FAKE TIMESTAMP: amo calcola speed = distanza / delta_time.
+    // Se mentiamo su l.time (fake time offset), speed apparente = safe → amo accetta.
+    // Formula: fake_delta_time = distanza_km / 900 km/h → speed apparente 900 km/h (sotto 1000 limit).
     private fun startCountryTourTeleport(
         targets: List<DoubleArray>,
         codes: List<String>,
@@ -626,53 +627,44 @@ class MockLocationService : Service() {
         running = true
         worker = Thread {
             var totalDone = 0
-            val pushIntervalMs = 200L  // 5 push/sec durante dwell
-            val gpsLossGapSec = 20     // pausa "GPS perso" tra paesi
+            val pushIntervalMs = 200L
+            val fakeSpeedKmh = 900.0  // safe sotto il limite 1000
+            var fakeTimeMs = System.currentTimeMillis()
+            var prevLat: Double? = null
+            var prevLng: Double? = null
 
-            // per generare GPS loss dobbiamo DISABILITARE i test provider, altrimenti fused Location
-            // continua a ricevere la vecchia posizione.
             for ((idx, tgt) in targets.withIndex()) {
                 if (!running) break
                 val tLat = tgt[0]; val tLng = tgt[1]
                 val code = codes.getOrNull(idx) ?: "?"
 
-                // GPS LOSS: disabilita provider mock (non push) per gpsLossGapSec
-                if (idx > 0) {
-                    updateNotification("TELEPORT: GPS loss window ${gpsLossGapSec}s prima di $code")
-                    for (p in testProviders) {
-                        try { lm.setTestProviderEnabled(p, false) } catch (_: Exception) {}
-                    }
-                    val g0 = System.currentTimeMillis()
-                    while (running && (System.currentTimeMillis() - g0) < gpsLossGapSec * 1000L) {
-                        sleep(500)
-                    }
-                    if (!running) break
-                    // riabilita provider per la prossima
-                    for (p in testProviders) {
-                        try {
-                            lm.setTestProviderEnabled(p, true)
-                        } catch (_: Exception) {}
-                    }
+                // avanza fake_time della quantita giusta per fake_speed
+                if (prevLat != null && prevLng != null) {
+                    val cosLat = cos(Math.toRadians((prevLat!! + tLat) / 2.0))
+                    val distKm = distM(doubleArrayOf(prevLat!!, prevLng!!), doubleArrayOf(tLat, tLng), cosLat) / 1000.0
+                    val fakeTravelMs = (distKm / fakeSpeedKmh * 3600.0 * 1000.0).toLong()
+                    fakeTimeMs += fakeTravelMs
+                    updateNotification("TELEPORT ${idx+1}/${targets.size}: $code (fake +${fakeTravelMs/1000}s per ${distKm.toInt()}km)")
                 }
 
-                // Burst iniziale: 10 push rapidi sulla nuova capitale
+                // Burst iniziale sulla nuova capitale con fake timestamp
                 for (r in 0 until 10) {
                     if (!running) break
                     val jLat = tLat + (Math.random() - 0.5) * 0.00002
                     val jLng = tLng + (Math.random() - 0.5) * 0.00002
-                    push(jLat, jLng, 0f, 0f)
+                    pushWithTime(jLat, jLng, 0f, 0f, fakeTimeMs)
+                    fakeTimeMs += 50
                     sleep(50)
                 }
                 if (!running) break
 
-                updateNotification("TELEPORT ${idx + 1}/${targets.size}: $code (dwell ${dwellSec}s)")
-
-                // dwell con push 5Hz sulla capitale
+                // dwell con push 5Hz sulla capitale (timestamp fake avanza normale)
                 val t0 = System.currentTimeMillis()
                 while (running && (System.currentTimeMillis() - t0) < dwellSec * 1000L) {
                     val jLat = tLat + (Math.random() - 0.5) * 0.00002
                     val jLng = tLng + (Math.random() - 0.5) * 0.00002
-                    push(jLat, jLng, 0f, 0f)
+                    pushWithTime(jLat, jLng, 0f, 0f, fakeTimeMs)
+                    fakeTimeMs += pushIntervalMs
                     val left = (dwellSec * 1000L - (System.currentTimeMillis() - t0)) / 1000L
                     broadcast(tLat, tLng, 100, left)
                     sleep(pushIntervalMs)
@@ -681,17 +673,34 @@ class MockLocationService : Service() {
 
                 totalDone++
                 broadcastCountryDone(code, tLat, tLng)
+                prevLat = tLat; prevLng = tLng
             }
             updateNotification("TELEPORT TOUR completato: $totalDone/${targets.size} paesi")
             val last = targets.lastOrNull()
             while (running && last != null) {
-                push(last[0], last[1], 0f, 0f)
+                pushWithTime(last[0], last[1], 0f, 0f, fakeTimeMs)
+                fakeTimeMs += UPDATE_MS * 3
                 sleep(UPDATE_MS * 3)
             }
         }.also { it.start() }
-        val gapPerCountry = 20
-        val eta = targets.size * (dwellSec + gapPerCountry) / 60
-        updateNotification("TELEPORT TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s + gap ${gapPerCountry}s (~${eta} min)")
+        val eta = targets.size * dwellSec / 60
+        updateNotification("TELEPORT TOUR (fake time) avviato: ${targets.size} paesi, dwell ${dwellSec}s (~${eta} min)")
+    }
+
+    // push identico a push() ma con timestamp forzato
+    private fun pushWithTime(lat: Double, lng: Double, speed: Float, bearing: Float, timeMs: Long) {
+        for (p in testProviders) {
+            try {
+                val l = makeLocation(p, lat, lng, speed, bearing)
+                l.time = timeMs
+                lm.setTestProviderLocation(p, l)
+            } catch (e: Exception) {}
+        }
+        try {
+            val l = makeLocation(LocationManager.GPS_PROVIDER, lat, lng, speed, bearing)
+            l.time = timeMs
+            fused?.setMockLocation(l)
+        } catch (e: Exception) {}
     }
 
     private fun Double.format(digits: Int): String = "%.${digits}f".format(this)
