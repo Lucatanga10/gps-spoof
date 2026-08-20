@@ -616,9 +616,8 @@ class MockLocationService : Service() {
         updateNotification("TOUR avviato: ${targets.size} paesi da ${fromLat.format(3)},${fromLng.format(3)} @ ${speedKmh.toInt()} km/h")
     }
 
-    // TELEPORT: nessun walk, salta direttamente sulla capitale + push burst intensivo
-    // Amo probabilmente vuole cluster di N sample nella stessa hex per committare scratch.
-    // Push a 5Hz (200ms) durante tutto dwell = tanti sample → cluster satisfatto.
+    // TELEPORT con GPS LOSS gap: tra paesi non pusho niente per N sec.
+    // Amo (se ha "GPS assente > X → reset") riparte fresh su nuova coord senza speed check.
     private fun startCountryTourTeleport(
         targets: List<DoubleArray>,
         codes: List<String>,
@@ -627,13 +626,36 @@ class MockLocationService : Service() {
         running = true
         worker = Thread {
             var totalDone = 0
-            val pushIntervalMs = 200L  // 5 push/sec
+            val pushIntervalMs = 200L  // 5 push/sec durante dwell
+            val gpsLossGapSec = 20     // pausa "GPS perso" tra paesi
+
+            // per generare GPS loss dobbiamo DISABILITARE i test provider, altrimenti fused Location
+            // continua a ricevere la vecchia posizione.
             for ((idx, tgt) in targets.withIndex()) {
                 if (!running) break
                 val tLat = tgt[0]; val tLng = tgt[1]
                 val code = codes.getOrNull(idx) ?: "?"
 
-                // Burst iniziale: 10 push rapidi (50ms apart) per fix immediato
+                // GPS LOSS: disabilita provider mock (non push) per gpsLossGapSec
+                if (idx > 0) {
+                    updateNotification("TELEPORT: GPS loss window ${gpsLossGapSec}s prima di $code")
+                    for (p in testProviders) {
+                        try { lm.setTestProviderEnabled(p, false) } catch (_: Exception) {}
+                    }
+                    val g0 = System.currentTimeMillis()
+                    while (running && (System.currentTimeMillis() - g0) < gpsLossGapSec * 1000L) {
+                        sleep(500)
+                    }
+                    if (!running) break
+                    // riabilita provider per la prossima
+                    for (p in testProviders) {
+                        try {
+                            lm.setTestProviderEnabled(p, true)
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                // Burst iniziale: 10 push rapidi sulla nuova capitale
                 for (r in 0 until 10) {
                     if (!running) break
                     val jLat = tLat + (Math.random() - 0.5) * 0.00002
@@ -643,16 +665,14 @@ class MockLocationService : Service() {
                 }
                 if (!running) break
 
-                updateNotification("TELEPORT ${idx + 1}/${targets.size}: $code (dwell ${dwellSec}s, burst 5Hz)")
+                updateNotification("TELEPORT ${idx + 1}/${targets.size}: $code (dwell ${dwellSec}s)")
 
-                // dwell con push 5Hz sulla capitale (satisfare cluster N di amo)
+                // dwell con push 5Hz sulla capitale
                 val t0 = System.currentTimeMillis()
-                var pushCount = 0
                 while (running && (System.currentTimeMillis() - t0) < dwellSec * 1000L) {
                     val jLat = tLat + (Math.random() - 0.5) * 0.00002
                     val jLng = tLng + (Math.random() - 0.5) * 0.00002
                     push(jLat, jLng, 0f, 0f)
-                    pushCount++
                     val left = (dwellSec * 1000L - (System.currentTimeMillis() - t0)) / 1000L
                     broadcast(tLat, tLng, 100, left)
                     sleep(pushIntervalMs)
@@ -669,8 +689,9 @@ class MockLocationService : Service() {
                 sleep(UPDATE_MS * 3)
             }
         }.also { it.start() }
-        val eta = targets.size * dwellSec / 60
-        updateNotification("TELEPORT TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s (~${eta} min totali)")
+        val gapPerCountry = 20
+        val eta = targets.size * (dwellSec + gapPerCountry) / 60
+        updateNotification("TELEPORT TOUR avviato: ${targets.size} paesi, dwell ${dwellSec}s + gap ${gapPerCountry}s (~${eta} min)")
     }
 
     private fun Double.format(digits: Int): String = "%.${digits}f".format(this)
